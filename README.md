@@ -1,6 +1,6 @@
 # Kubernetes Health and Cost Management Tool
 
-Ochestra AI is an cloud native K8's management tool that leverages artificial inteligence to simplify and automate the management of cloud native workloads on Kubernetes. Its main purpose is to help solve the challenges associated with operating cloud - native applications at scale - Complexity, Cost and Performance.
+Kubeopera is an cloud native K8's management tool that leverages artificial inteligence to simplify and automate the management of cloud native workloads on Kubernetes. Its main purpose is to help solve the challenges associated with operating cloud - native applications at scale - Complexity, Cost and Performance.
 
 
 ![image](https://github.com/user-attachments/assets/0c76c9bc-1c0a-43ec-ad9e-812a49ea2bb4)
