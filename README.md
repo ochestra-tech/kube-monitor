@@ -48,14 +48,14 @@ A comprehensive Go-based tool for monitoring Kubernetes cluster health and manag
 
 ```bash
 # Clone the repository
-git clone https://github.com/ochestra-tech/ochestra-ai
-cd ochestra-ai
+git clone https://github.com/ochestra-tech/kubeopera-ai
+cd kubeopera-ai
 
 # Download dependencies
 go mod tidy
 
 # Build the application
-go build -o ochestra-ai ./cmd/main.go
+go build -o kubeopera-ai ./cmd/main.go
 ```
 
 ### Dependencies
@@ -77,7 +77,7 @@ go get github.com/olekukonko/tablewriter@latest
 The tool uses your existing kubeconfig file. By default, it looks for `~/.kube/config`, but you can specify a different path:
 
 ```bash
-./ochestra-ai --kubeconfig /path/to/kubeconfig
+./kubeopera-ai --kubeconfig /path/to/kubeconfig
 ```
 
 ### Pricing Configuration
@@ -125,35 +125,35 @@ Create a `pricing-config.json` file to define your cloud pricing:
 #### Health Check
 ```bash
 # Quick health check
-./ochestra-ai --type health --format text
+./kubeopera-ai --type health --format text
 
 # Detailed health report in HTML
-./ochestra-ai --type health --format html --output health-report.html
+./kubeopera-ai --type health --format html --output health-report.html
 ```
 
 #### Cost Analysis
 ```bash
 # Cost report in JSON format
-./ochestra-ai --type cost --format json --output cost-report.json
+./kubeopera-ai --type cost --format json --output cost-report.json
 
 # Monthly cost breakdown
-./ochestra-ai --type cost --format text
+./kubeopera-ai --type cost --format text
 ```
 
 #### Combined Report
 ```bash
 # Complete health and cost analysis
-./ochestra-ai --type combined --format html --output cluster-report.html
+./kubeopera-ai --type combined --format html --output cluster-report.html
 ```
 
 ### Continuous Monitoring
 
 ```bash
 # Monitor every 5 minutes with Prometheus metrics
-./ochestra-ai --interval 5m --metrics-port 8080
+./kubeopera-ai --interval 5m --metrics-port 8080
 
 # Custom configuration
-./ochestra-ai \
+./kubeopera-ai \
   --kubeconfig ~/.kube/config \
   --pricing-config ./my-pricing.json \
   --interval 10m \
@@ -186,7 +186,7 @@ package main
 import (
     "context"
     "fmt"
-    "github.com/ochestra-tech/ochestra-ai/pkg/health"
+    "github.com/ochestra-tech/kubeopera-ai/pkg/health"
 )
 
 func main() {
@@ -212,7 +212,7 @@ package main
 
 import (
     "context"
-    "github.com/ochestra-tech/ochestra-ai/pkg/cost"
+    "github.com/ochestra-tech/kubeopera-ai/pkg/cost"
 )
 
 func main() {
@@ -243,7 +243,7 @@ package main
 import (
     "context"
     "os"
-    "github.com/ochestra-tech/ochestra-ai/pkg/reports"
+    "github.com/ochestra-tech/kubeopera-ai/pkg/reports"
 )
 
 func main() {
@@ -366,7 +366,7 @@ Total Monthly Cost:             $8,964.00
 ### Development Setup
 
 1. Fork the repository
-2. Clone your fork: `git clone https://github.com/your-username/ochestra-ai.git`
+2. Clone your fork: `git clone https://github.com/your-username/kubeopera-ai.git`
 3. Create a feature branch: `git checkout -b feature/your-feature-name`
 4. Make your changes
 5. Add tests for new functionality
@@ -437,7 +437,7 @@ Error: failed to parse pricing config
 
 Enable debug logging:
 ```bash
-./ochestra-ai --debug --type health
+./kubeopera-ai --debug --type health
 ```
 
 ### Log Analysis
@@ -445,10 +445,10 @@ Enable debug logging:
 Check application logs for detailed error information:
 ```bash
 # For container deployment
-kubectl logs -n monitoring deployment/ochestra-ai
+kubectl logs -n monitoring deployment/kubeopera-ai
 
 # For local deployment
-./ochestra-ai 2>&1 | tee app.log
+./kubeopera-ai 2>&1 | tee app.log
 ```
 
 ## License
@@ -457,9 +457,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/ochestra-tech/ochestra-ai/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/ochestra-tech/ochestra-ai/discussions)
-- **Documentation**: [Wiki](https://github.com/ochestra-tech/ochestra-ai/wiki)
+- **Issues**: [GitHub Issues](https://github.com/ochestra-tech/kubeopera-ai/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/ochestra-tech/kubeopera-ai/discussions)
+- **Documentation**: [Wiki](https://github.com/ochestra-tech/kubeopera-ai/wiki)
 
 ## Roadmap
 
