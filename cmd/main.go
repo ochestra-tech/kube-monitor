@@ -129,8 +129,8 @@ func init() {
 }
 
 func main() {
-	// Parse command line flags
-	config := parseFlags()
+
+	config := parseCommandLineFlags()
 
 	// Start metrics server
 	startMetricsServer(config.MetricsPort)
@@ -171,7 +171,7 @@ func main() {
 	}
 }
 
-func parseFlags() *Config {
+func parseCommandLineFlags() *Config {
 	config := &Config{}
 
 	// Default to $HOME/.kube/config for kubeconfig path
