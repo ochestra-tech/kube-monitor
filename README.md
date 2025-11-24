@@ -463,5 +463,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [ ] **Advanced forecasting**: ML-based cost prediction
 - [ ] **Cloud provider integration**: Direct billing API integration (KubeCostGuard Project)
 - [ ] **Slack/Teams notifications**: Real-time alerts
-- [ ] **Helm chart**: Easy deployment with Helm (KubeCostGuard Project)
+- [ ] **Helm chart**: Easy deployment with Helm
 - [ ] **Web UI**: Built-in web interface for centralized multi-cluster monitoring & observability (KubeCostOpera Project)
