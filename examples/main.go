@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -23,9 +23,9 @@ import (
 	"k8s.io/metrics/pkg/client/clientset/versioned"
 	metricsv "k8s.io/metrics/pkg/client/clientset/versioned"
 
-	"github.com/ochestra-tech/ochestra-ai/pkg/cost"
-	"github.com/ochestra-tech/ochestra-ai/pkg/health"
-	"github.com/ochestra-tech/ochestra-ai/pkg/reports"
+	"github.com/ochestra-tech/k8s-monitor/pkg/cost"
+	"github.com/ochestra-tech/k8s-monitor/pkg/health"
+	"github.com/ochestra-tech/k8s-monitor/pkg/reports"
 )
 
 // Config holds the application configuration
@@ -81,7 +81,6 @@ func main() {
 	ticker := time.NewTicker(config.CheckInterval)
 	defer ticker.Stop()
 
-
 	// Run first check immediately
 	if err := generateReport(ctx, clientset, metricsClient, pricing, config); err != nil {
 		log.Printf("Failed to generate initial report: %v", err)
@@ -95,31 +94,31 @@ func main() {
 	}
 
 	// Run resource optimization analysis
-    optimizer := NewResourceOptimizer(clientset, metricsClient)
-    report, err := optimizer.GenerateOptimizationReport(context.Background())
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    fmt.Printf("Potential Monthly Savings: $%.2f\n", report.PotentialSavings)
-    fmt.Printf("Optimization Recommendations: %d\n", len(report.Recommendations))
-    
-    for _, rec := range report.Recommendations {
-        fmt.Printf("- %s: %s (Save $%.2f/month)\n", 
-            rec.Type, rec.Description, rec.PotentialSaving)
-    }
-    
-    // Run cleanup with dry-run
-    cleanupRecs, err := CleanupUnusedResources(context.Background(), clientset, true)
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    fmt.Printf("\nCleanup Recommendations: %d\n", len(cleanupRecs))
-    for _, rec := range cleanupRecs {
-        fmt.Printf("- Delete %s %s/%s: %s\n", 
-            rec.ResourceType, rec.Namespace, rec.Name, rec.Reason)
-    }
+	optimizer := NewResourceOptimizer(clientset, metricsClient)
+	report, err := optimizer.GenerateOptimizationReport(context.Background())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("Potential Monthly Savings: $%.2f\n", report.PotentialSavings)
+	fmt.Printf("Optimization Recommendations: %d\n", len(report.Recommendations))
+
+	for _, rec := range report.Recommendations {
+		fmt.Printf("- %s: %s (Save $%.2f/month)\n",
+			rec.Type, rec.Description, rec.PotentialSaving)
+	}
+
+	// Run cleanup with dry-run
+	cleanupRecs, err := CleanupUnusedResources(context.Background(), clientset, true)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("\nCleanup Recommendations: %d\n", len(cleanupRecs))
+	for _, rec := range cleanupRecs {
+		fmt.Printf("- Delete %s %s/%s: %s\n",
+			rec.ResourceType, rec.Namespace, rec.Name, rec.Reason)
+	}
 }
 
 // parseFlags parses command line flags and returns configuration
@@ -307,28 +306,18 @@ func RunHealthCheck(ctx context.Context, clientset *kubernetes.Clientset, metric
 		"totalNodes":     healthData.NodeStatus.TotalNodes,
 		"runningPods":    healthData.PodStatus.RunningPods,
 		"totalPods":      healthData.PodStatus.TotalPods,
-		"criticalIssues": countIssuesBySeverity(healthData.Issues, "critical"),
-		"warningIssues":  countIssuesBySeverity(healthData.Issues, "warning"),
-		"cpuUsage":       healthData.ResourceUsage.ClusterCPUUsage,
-		"memoryUsage":    healthData.ResourceUsage.ClusterMemoryUsage,
-	summary := map[string]interface{}{
-		"healthScore":    healthData.HealthScore,
-		"readyNodes":     healthData.NodeStatus.ReadyNodes,
-		"totalNodes":     healthData.NodeStatus.TotalNodes,
-		"runningPods":    healthData.PodStatus.RunningPods,
-		"totalPods":      healthData.PodStatus.TotalPods,
 		"criticalIssues": len(filterIssuesBySeverity(healthData.Issues, "critical")),
 		"warningIssues":  len(filterIssuesBySeverity(healthData.Issues, "warning")),
 		"cpuUsage":       healthData.ResourceUsage.ClusterCPUUsage,
 		"memoryUsage":    healthData.ResourceUsage.ClusterMemoryUsage,
 	}
-	}
+
 	return summary, nil
 }
 
 // filterIssuesBySeverity filters issues by their severity level
-func filterIssuesBySeverity(issues []health.Issue, severity string) []health.Issue {
-	filtered := make([]health.Issue, 0)
+func filterIssuesBySeverity(issues []health.HealthIssue, severity string) []health.HealthIssue {
+	filtered := make([]health.HealthIssue, 0)
 	for _, issue := range issues {
 		if issue.Severity == severity {
 			filtered = append(filtered, issue)
@@ -336,98 +325,11 @@ func filterIssuesBySeverity(issues []health.Issue, severity string) []health.Iss
 	}
 	return filtered
 }
-	currentMonthlyTotal := 0.0
-	for _, node := range nodeCosts {
-		currentMonthlyTotal += node.TotalCost * 24 * 30
-	}
 
-	// Create forecast based on simple growth assumptions
-	// In a real implementation, this could use historical data and machine learning
-	forecast := &CostForecast{
-		CurrentMonthlyCost: currentMonthlyTotal,
-		Months:             months,
-		MonthlyForecasts:   make([]MonthlyForecast, months),
-	}
-
-	// Assume 5% monthly growth
-	growthRate := 0.05
-	for i := 0; i < months; i++ {
-		monthCost := currentMonthlyTotal * math.Pow(1+growthRate, float64(i))
-		forecast.MonthlyForecasts[i] = MonthlyForecast{
-			Month:           i + 1,
-			CostEstimate:    monthCost,
-			ConfidenceLevel: 85, // High confidence for near-term, decreasing over time
-		}
-
-		// Decrease confidence over time
-		if i > 3 {
-			forecast.MonthlyForecasts[i].ConfidenceLevel = 85 - (i-3)*10
-		}
-	}
-
-	// Add cost breakdown by resource type
-	totalCPUCost := 0.0
-	totalMemoryCost := 0.0
-	totalStorageCost := 0.0
-
-	for _, node := range nodeCosts {
-		totalCPUCost += node.CPUCost * 24 * 30
-		totalMemoryCost += node.MemoryCost * 24 * 30
-		totalStorageCost += node.StorageCost * 24 * 30
-	}
-
-	forecast.ResourceBreakdown = map[string]float64{
-		"CPU":     totalCPUCost,
-		"Memory":  totalMemoryCost,
-		"Storage": totalStorageCost,
-	}
-
-	return forecast, nil
-}
-
-// MonitorCostChanges monitors cost changes over time and sends alerts
-func MonitorCostChanges(ctx context.Context, clientset *kubernetes.Clientset, metricsClient *metricsv.Clientset, pricing map[string]cost.ResourcePricing, thresholdPercent float64) {
-	// Get initial cost baseline
-	baselineCosts, err := cost.GetNodeCosts(ctx, clientset, metricsClient, pricing)
-	if err != nil {
-		log.Printf("Failed to get baseline costs: %v", err)
-		return
-	}
-
-	baselineTotal := 0.0
-	for _, node := range baselineCosts {
-		baselineTotal += node.TotalCost
-	}
-
-	// Monitor costs every 30 minutes
-	ticker := time.NewTicker(30 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		currentCosts, err := cost.GetNodeCosts(ctx, clientset, metricsClient, pricing)
-		if err != nil {
-			log.Printf("Failed to get current costs: %v", err)
-			continue
-		}
-
-		currentTotal := 0.0
-		for _, node := range currentCosts {
-			currentTotal += node.TotalCost
-		}
-
-		// Calculate percentage change
-		percentChange := ((currentTotal - baselineTotal) / baselineTotal) * 100
-
-		if math.Abs(percentChange) > thresholdPercent {
-			alertMessage := fmt.Sprintf("Cost change alert: %.1f%% change detected. Current hourly cost: $%.2f/hour",
-				percentChange, currentTotal)
-			log.Printf("ALERT: %s", alertMessage)
-
-			// In a production system, this would send alerts through various channels
-			// (email, slack, PagerDuty, etc.)
-		}
-	}
-}
+// Cost monitoring implementation was removed from the top-level file scope because it
+// contained executable statements outside of any function; move cost monitoring or
+// forecasting logic into a dedicated function (e.g. MonitorCosts) if needed.
+// TODO: implement MonitorCosts(ctx, clientset, metricsClient, pricing) as appropriate.
 
 // CleanupUnusedResources identifies and optionally cleans up unused resources
 func CleanupUnusedResources(ctx context.Context, clientset *kubernetes.Clientset, dryRun bool) ([]CleanupRecommendation, error) {

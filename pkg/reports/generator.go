@@ -7,14 +7,14 @@ import (
 	"html/template"
 	"io"
 	"sort"
+	"strings"
 	"time"
 
-	"github.com/olekukonko/tablewriter"
 	"k8s.io/client-go/kubernetes"
 	metricsv "k8s.io/metrics/pkg/client/clientset/versioned"
 
-	"github.com/ochestra-tech/ochestra-ai/pkg/cost"
-	"github.com/ochestra-tech/ochestra-ai/pkg/health"
+	"github.com/ochestra-tech/k8s-monitor/pkg/cost"
+	"github.com/ochestra-tech/k8s-monitor/pkg/health"
 )
 
 // ReportFormat specifies the output format for reports
@@ -381,34 +381,39 @@ func (r *ReportGenerator) generateCostReportText(podCosts []cost.PodCostData, no
 
 	// Node Cost Summary
 	fmt.Fprintf(r.writer, "--- Node Cost Summary ---\n")
-	table := tablewriter.NewWriter(r.writer)
-	table.SetHeader([]string{"Node", "Instance Type", "Hourly Cost", "CPU Cost", "Memory Cost", "Utilization"})
 
 	// Sort by cost descending
 	sort.Slice(nodeCosts, func(i, j int) bool {
 		return nodeCosts[i].TotalCost > nodeCosts[j].TotalCost
 	})
 
+	// Print header
+	fmt.Fprintf(r.writer, "%-36s %-20s %12s %12s %12s %12s\n",
+		"Node", "Instance Type", "Hourly Cost", "CPU Cost", "Memory Cost", "Utilization")
+	fmt.Fprintf(r.writer, "%s\n", strings.Repeat("-", 110))
+
+	// Print rows (limit to top 10)
 	for i, node := range nodeCosts {
 		if i >= 10 { // Limit to top 10 nodes
 			break
 		}
-		table.Append([]string{
+		fmt.Fprintf(r.writer, "%-36s %-20s %12s %12s %12s %11s\n",
 			node.Name,
 			node.InstanceType,
 			fmt.Sprintf("$%.2f", node.TotalCost),
 			fmt.Sprintf("$%.2f", node.CPUCost),
 			fmt.Sprintf("$%.2f", node.MemoryCost),
 			fmt.Sprintf("%.1f%%", node.Utilization),
-		})
+		)
 	}
-	table.Render()
-	fmt.Fprintf(r.writer, "\n")
 
 	// Namespace Cost Summary
 	fmt.Fprintf(r.writer, "--- Namespace Cost Summary ---\n")
-	table = tablewriter.NewWriter(r.writer)
-	table.SetHeader([]string{"Namespace", "Total Cost", "Pod Count", "CPU Cost", "Memory Cost"})
+
+	// Print header
+	fmt.Fprintf(r.writer, "%-30s %12s %10s %12s %12s\n",
+		"Namespace", "Total Cost", "Pod Count", "CPU Cost", "Memory Cost")
+	fmt.Fprintf(r.writer, "%s\n", strings.Repeat("-", 82))
 
 	// Sort namespaces by cost
 	sort.Slice(namespaceCosts, func(i, j int) bool {
@@ -416,14 +421,14 @@ func (r *ReportGenerator) generateCostReportText(podCosts []cost.PodCostData, no
 	})
 
 	for _, ns := range namespaceCosts {
-		table.Append([]string{
-			ns.Namespace,
+		fmt.Fprintf(r.writer, "%-30s %12s %10d %12s %12s\n",
+			ns.Name,
 			fmt.Sprintf("$%.2f", ns.TotalCost),
-			fmt.Sprintf("%d", ns.PodCount),
+			ns.PodCount,
 			fmt.Sprintf("$%.2f", ns.CPUCost),
 			fmt.Sprintf("$%.2f", ns.MemoryCost),
-		})
+		)
 	}
-	table.Render()
+
 	return nil
 }

@@ -1,9 +1,4 @@
-# Kubernetes Health and Cost Management Tool
-
-Kubeopera is an cloud native K8's management tool that leverages artificial inteligence to simplify and automate the management of cloud native workloads on Kubernetes. Its main purpose is to help solve the challenges associated with operating cloud - native applications at scale - Complexity, Cost and Performance.
-
-
-![image](https://github.com/user-attachments/assets/0c76c9bc-1c0a-43ec-ad9e-812a49ea2bb4)
+# A Simple Easy to Use Kubernetes Health and Cost Tracking Tool
 
 A comprehensive Go-based tool for monitoring Kubernetes cluster health and managing costs. This tool provides real-time health assessments, cost tracking, optimization recommendations, and detailed reporting for Kubernetes environments.
 
@@ -48,14 +43,14 @@ A comprehensive Go-based tool for monitoring Kubernetes cluster health and manag
 
 ```bash
 # Clone the repository
-git clone https://github.com/ochestra-tech/kubeopera-ai
-cd kubeopera-ai
+git clone https://github.com/ochestra-tech/k8s-monitor
+cd k8s-monitor
 
 # Download dependencies
 go mod tidy
 
 # Build the application
-go build -o kubeopera-ai ./cmd/main.go
+go build -o k8s-monitor ./cmd/main.go
 ```
 
 ### Dependencies
@@ -77,7 +72,7 @@ go get github.com/olekukonko/tablewriter@latest
 The tool uses your existing kubeconfig file. By default, it looks for `~/.kube/config`, but you can specify a different path:
 
 ```bash
-./kubeopera-ai --kubeconfig /path/to/kubeconfig
+./k8s-monitor --kubeconfig /path/to/kubeconfig
 ```
 
 ### Pricing Configuration
@@ -125,35 +120,35 @@ Create a `pricing-config.json` file to define your cloud pricing:
 #### Health Check
 ```bash
 # Quick health check
-./kubeopera-ai --type health --format text
+./k8s-monitor --type health --format text
 
 # Detailed health report in HTML
-./kubeopera-ai --type health --format html --output health-report.html
+./k8s-monitor --type health --format html --output health-report.html
 ```
 
 #### Cost Analysis
 ```bash
 # Cost report in JSON format
-./kubeopera-ai --type cost --format json --output cost-report.json
+./k8s-monitor --type cost --format json --output cost-report.json
 
 # Monthly cost breakdown
-./kubeopera-ai --type cost --format text
+./k8s-monitor --type cost --format text
 ```
 
 #### Combined Report
 ```bash
 # Complete health and cost analysis
-./kubeopera-ai --type combined --format html --output cluster-report.html
+./k8s-monitor --type combined --format html --output cluster-report.html
 ```
 
 ### Continuous Monitoring
 
 ```bash
 # Monitor every 5 minutes with Prometheus metrics
-./kubeopera-ai --interval 5m --metrics-port 8080
+./k8s-monitor --interval 5m --metrics-port 8080
 
 # Custom configuration
-./kubeopera-ai \
+./k8s-monitor \
   --kubeconfig ~/.kube/config \
   --pricing-config ./my-pricing.json \
   --interval 10m \
@@ -186,7 +181,7 @@ package main
 import (
     "context"
     "fmt"
-    "github.com/ochestra-tech/kubeopera-ai/pkg/health"
+    "github.com/ochestra-tech/k8s-monitor/pkg/health"
 )
 
 func main() {
@@ -212,7 +207,7 @@ package main
 
 import (
     "context"
-    "github.com/ochestra-tech/kubeopera-ai/pkg/cost"
+    "github.com/ochestra-tech/k8s-monitor/pkg/cost"
 )
 
 func main() {
@@ -243,7 +238,7 @@ package main
 import (
     "context"
     "os"
-    "github.com/ochestra-tech/kubeopera-ai/pkg/reports"
+    "github.com/ochestra-tech/k8s-monitor/pkg/reports"
 )
 
 func main() {
@@ -366,7 +361,7 @@ Total Monthly Cost:             $8,964.00
 ### Development Setup
 
 1. Fork the repository
-2. Clone your fork: `git clone https://github.com/your-username/kubeopera-ai.git`
+2. Clone your fork: `git clone https://github.com/your-username/k8s-monitor.git`
 3. Create a feature branch: `git checkout -b feature/your-feature-name`
 4. Make your changes
 5. Add tests for new functionality
@@ -437,7 +432,7 @@ Error: failed to parse pricing config
 
 Enable debug logging:
 ```bash
-./kubeopera-ai --debug --type health
+./k8s-monitor --debug --type health
 ```
 
 ### Log Analysis
@@ -445,10 +440,10 @@ Enable debug logging:
 Check application logs for detailed error information:
 ```bash
 # For container deployment
-kubectl logs -n monitoring deployment/kubeopera-ai
+kubectl logs -n monitoring deployment/k8s-monitor
 
 # For local deployment
-./kubeopera-ai 2>&1 | tee app.log
+./k8s-monitor 2>&1 | tee app.log
 ```
 
 ## License
@@ -457,9 +452,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/ochestra-tech/kubeopera-ai/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/ochestra-tech/kubeopera-ai/discussions)
-- **Documentation**: [Wiki](https://github.com/ochestra-tech/kubeopera-ai/wiki)
+- **Issues**: [GitHub Issues](https://github.com/ochestra-tech/k8s-monitor/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/ochestra-tech/k8s-monitor/discussions)
+- **Documentation**: [Wiki](https://github.com/ochestra-tech/k8s-monitor/wiki)
 
 ## Roadmap
 
@@ -470,13 +465,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [ ] **Slack/Teams notifications**: Real-time alerts
 - [ ] **Helm chart**: Easy deployment with Helm (KubeCostGuard Project)
 - [ ] **Web UI**: Built-in web interface for centralized multi-cluster monitoring & observability (KubeCostOpera Project)
-
-## Acknowledgments
-
-- [Kubernetes client-go](https://github.com/kubernetes/client-go) - Kubernetes API client
-- [Prometheus client](https://github.com/prometheus/client_golang) - Metrics collection
-- [TableWriter](https://github.com/olekukonko/tablewriter) - Beautiful table output
-
----
-
-*Built with ❤️ for the Kubernetes community*
