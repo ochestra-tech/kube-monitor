@@ -2,179 +2,205 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"sort"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/metrics/pkg/client/clientset/versioned"
+	metricsv "k8s.io/metrics/pkg/client/clientset/versioned"
+
+	awsp "github.com/ochestra-tech/k8s-monitor/internal/adapters/pricing/aws"
+	azurep "github.com/ochestra-tech/k8s-monitor/internal/adapters/pricing/azure"
+	gcpp "github.com/ochestra-tech/k8s-monitor/internal/adapters/pricing/gcp"
+	staticp "github.com/ochestra-tech/k8s-monitor/internal/adapters/pricing/static"
+	reportingadapter "github.com/ochestra-tech/k8s-monitor/internal/adapters/reporting"
+	apppricing "github.com/ochestra-tech/k8s-monitor/internal/app/pricing"
+	appreporting "github.com/ochestra-tech/k8s-monitor/internal/app/reporting"
+	domainpricing "github.com/ochestra-tech/k8s-monitor/internal/domain/pricing"
+	portspricing "github.com/ochestra-tech/k8s-monitor/internal/ports/pricing"
+	"github.com/ochestra-tech/k8s-monitor/pkg/cost"
+	"github.com/ochestra-tech/k8s-monitor/pkg/reports"
 )
 
-// Configuration options
-type Config struct {
-	KubeConfigPath   string
-	Interval         time.Duration
-	MetricsPort      int
-	OutputFile       string
-	EnableCostReport bool
-	PricingDataFile  string
-}
+const defaultPricingConfigPath = "configs/pricing-config.json"
 
-// Cost data for different node types and regions
-type PricingData struct {
-	Nodes map[string]NodePricing `json:"nodes"`
-}
-
-type NodePricing struct {
-	CPUCostPerHour     float64 `json:"cpuCostPerHour"`
-	MemoryCostPerGBHr  float64 `json:"memoryCostPerGBHr"`
-	StorageCostPerGBHr float64 `json:"storageCostPerGBHr"`
-	RegionMultiplier   float64 `json:"regionMultiplier"`
-}
-
-// ClusterHealth represents the health status of the cluster
-type ClusterHealth struct {
-	TotalNodes              int     `json:"totalNodes"`
-	ReadyNodes              int     `json:"readyNodes"`
-	ResourceUtilization     float64 `json:"resourceUtilization"`
-	PendingPods             int     `json:"pendingPods"`
-	FailedPods              int     `json:"failedPods"`
-	CriticalComponentsOK    bool    `json:"criticalComponentsOK"`
-	MemoryPressureNodes     int     `json:"memoryPressureNodes"`
-	DiskPressureNodes       int     `json:"diskPressureNodes"`
-	PIDPressureNodes        int     `json:"pidPressureNodes"`
-	NetworkUnavailableNodes int     `json:"networkUnavailableNodes"`
-}
-
-// CostReport represents the estimated costs for the cluster
-type CostReport struct {
-	TotalCostPerHour   float64               `json:"totalCostPerHour"`
-	TotalCostPerMonth  float64               `json:"totalCostPerMonth"`
-	CostByNamespace    map[string]float64    `json:"costByNamespace"`
-	CostByNodeType     map[string]float64    `json:"costByNodeType"`
-	EfficientWorkloads []string              `json:"efficientWorkloads"`
-	Recommendations    []CostOptimizationRec `json:"recommendations"`
-}
-
-// CostOptimizationRec represents a cost optimization recommendation
-type CostOptimizationRec struct {
-	Type        string  `json:"type"`
-	Resource    string  `json:"resource"`
-	Namespace   string  `json:"namespace"`
-	Description string  `json:"description"`
-	Savings     float64 `json:"savings"`
-}
-
-// Prometheus metrics
 var (
-	nodeStatusGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "k8s_health_manager_node_status",
-			Help: "Status of Kubernetes nodes (1=ready, 0=not ready)",
+	reportRunDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "k8s_monitor_report_duration_seconds",
+			Help:    "Duration of report generation by type and status.",
+			Buckets: prometheus.DefBuckets,
 		},
-		[]string{"node"},
+		[]string{"report_type", "status"},
 	)
 
-	podStatusGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "k8s_health_manager_pod_status",
-			Help: "Status of Kubernetes pods (2=running, 1=pending, 0=failed)",
+	reportRunTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "k8s_monitor_report_total",
+			Help: "Total number of report runs by type and status.",
 		},
-		[]string{"namespace", "pod"},
+		[]string{"report_type", "status"},
 	)
 
-	namespaceResourceUsageGauge = prometheus.NewGaugeVec(
+	reportLastSuccessTimestamp = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "k8s_health_manager_namespace_resource_usage",
-			Help: "Resource usage by namespace",
+			Name: "k8s_monitor_report_last_success_timestamp_seconds",
+			Help: "Unix timestamp of the last successful report run by type.",
 		},
-		[]string{"namespace", "resource_type"},
+		[]string{"report_type"},
 	)
 
-	namespaceCostGauge = prometheus.NewGaugeVec(
+	podPhaseTotal = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "k8s_health_manager_namespace_cost",
-			Help: "Estimated cost per namespace per hour",
+			Name: "k8s_monitor_pods_phase_total",
+			Help: "Number of pods by phase across the cluster.",
+		},
+		[]string{"phase"},
+	)
+
+	namespacePodPhaseTotal = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "k8s_monitor_namespace_pods_phase_total",
+			Help: "Number of pods by phase for top namespaces (others aggregated).",
+		},
+		[]string{"namespace", "phase"},
+	)
+
+	namespacePodTotal = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "k8s_monitor_namespace_pods_total",
+			Help: "Number of pods per top namespace (others aggregated).",
 		},
 		[]string{"namespace"},
-	)
-
-	resourceEfficiencyGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "k8s_health_manager_resource_efficiency",
-			Help: "Resource efficiency (usage/requests ratio)",
-		},
-		[]string{"namespace", "resource_type"},
 	)
 )
 
 func init() {
-	// Register Prometheus metrics
-	prometheus.MustRegister(nodeStatusGauge)
-	prometheus.MustRegister(podStatusGauge)
-	prometheus.MustRegister(namespaceResourceUsageGauge)
-	prometheus.MustRegister(namespaceCostGauge)
-	prometheus.MustRegister(resourceEfficiencyGauge)
+	prometheus.MustRegister(reportRunDuration)
+	prometheus.MustRegister(reportRunTotal)
+	prometheus.MustRegister(reportLastSuccessTimestamp)
+	prometheus.MustRegister(podPhaseTotal)
+	prometheus.MustRegister(namespacePodPhaseTotal)
+	prometheus.MustRegister(namespacePodTotal)
+}
+
+// Config holds the application configuration
+type Config struct {
+	KubeConfigPath           string
+	PricingConfigPath        string
+	ReportFormat             reports.ReportFormat
+	ReportPath               string
+	CheckInterval            time.Duration
+	MetricsPort              int
+	MetricsReadHeaderTimeout time.Duration
+	RequestTimeout           time.Duration
+	ShutdownTimeout          time.Duration
+	EnableDetailedMetrics    bool
+	MetricsTopNamespaces     int
+	DetailedMetricsInterval  time.Duration
+	PricingDebug             bool
+	PricingDebugLogPath      string
+	OneShot                  bool
+	ReportType               string // "health", "cost", "combined"
 }
 
 func main() {
+	config := parseFlags()
 
-	config := parseCommandLineFlags()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	// Start metrics server
-	startMetricsServer(config.MetricsPort)
+	clientset, metricsClient := initKubernetesClients(config.KubeConfigPath)
+	pricing, err := resolvePricing(ctx, config.PricingConfigPath, config.PricingDebug, config.PricingDebugLogPath)
+	if err != nil {
+		log.Fatalf("Failed to resolve pricing: %v", err)
+	}
 
-	// Load pricing data for cost estimation
-	pricingData := loadPricingData(config.PricingDataFile)
+	if config.OneShot {
+		if err := runWithTimeout(ctx, config.RequestTimeout, func(runCtx context.Context) error {
+			return executeReportCycle(runCtx, clientset, metricsClient, pricing, config)
+		}); err != nil {
+			log.Fatalf("Failed to generate report: %v", err)
+		}
+		if config.EnableDetailedMetrics {
+			if err := updateDetailedMetrics(ctx, clientset, config.MetricsTopNamespaces); err != nil {
+				log.Printf("Failed to update detailed metrics: %v", err)
+			}
+		}
+		return
+	}
 
-	// Initialize Kubernetes client
-	clientset, metricsClient := initKubernetesClient(config.KubeConfigPath)
+	metricsServer := startMetricsServer(config.MetricsPort, config.MetricsReadHeaderTimeout)
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
+		defer cancel()
+		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Metrics server shutdown error: %v", err)
+		}
+	}()
 
-	// Run continuous health and cost checks
-	ticker := time.NewTicker(config.Interval)
+	ticker := time.NewTicker(config.CheckInterval)
 	defer ticker.Stop()
 
+	if err := runWithTimeout(ctx, config.RequestTimeout, func(runCtx context.Context) error {
+		return executeReportCycle(runCtx, clientset, metricsClient, pricing, config)
+	}); err != nil {
+		log.Printf("Failed to generate initial report: %v", err)
+	}
+	if config.EnableDetailedMetrics {
+		if err := updateDetailedMetrics(ctx, clientset, config.MetricsTopNamespaces); err != nil {
+			log.Printf("Failed to update detailed metrics: %v", err)
+		}
+	}
+
+	var detailedTicker *time.Ticker
+	var detailedC <-chan time.Time
+	if config.EnableDetailedMetrics {
+		interval := config.DetailedMetricsInterval
+		if interval <= 0 {
+			interval = config.CheckInterval
+		}
+		detailedTicker = time.NewTicker(interval)
+		detailedC = detailedTicker.C
+		defer detailedTicker.Stop()
+	}
+
 	for {
-		// Check cluster health
-		health := checkClusterHealth(clientset)
-
-		// Generate cost report if enabled
-		var costReport *CostReport
-		if config.EnableCostReport {
-			costReport = generateCostReport(clientset, metricsClient, pricingData)
+		select {
+		case <-ctx.Done():
+			log.Printf("Shutting down: %v", ctx.Err())
+			return
+		case <-ticker.C:
+			if err := runWithTimeout(ctx, config.RequestTimeout, func(runCtx context.Context) error {
+				return executeReportCycle(runCtx, clientset, metricsClient, pricing, config)
+			}); err != nil {
+				log.Printf("Failed to generate report: %v", err)
+			}
+		case <-detailedC:
+			if err := updateDetailedMetrics(ctx, clientset, config.MetricsTopNamespaces); err != nil {
+				log.Printf("Failed to update detailed metrics: %v", err)
+			}
 		}
-
-		// Update Prometheus metrics
-		updateMetrics(clientset, metricsClient)
-
-		// Output results
-		if config.OutputFile != "" {
-			outputResults(config.OutputFile, health, costReport)
-		}
-
-		// Print summary to stdout
-		printSummary(health, costReport)
-
-		// Wait for next interval
-		<-ticker.C
 	}
 }
 
-func parseCommandLineFlags() *Config {
+func parseFlags() *Config {
 	config := &Config{}
 
-	// Default to $HOME/.kube/config for kubeconfig path
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		log.Fatalf("Failed to get user home directory: %v", err)
@@ -182,102 +208,73 @@ func parseCommandLineFlags() *Config {
 	defaultKubeConfig := filepath.Join(homeDir, ".kube", "config")
 
 	flag.StringVar(&config.KubeConfigPath, "kubeconfig", defaultKubeConfig, "Path to kubeconfig file")
-	flag.DurationVar(&config.Interval, "interval", 60*time.Second, "Check interval in seconds")
+	flag.StringVar(&config.PricingConfigPath, "pricing-config", defaultPricingConfigPath, "Path to pricing configuration file")
+	flag.StringVar((*string)(&config.ReportFormat), "format", string(reports.FormatText), "Report format (text, json, html)")
+	flag.StringVar(&config.ReportPath, "output", "", "Output file path (empty for stdout)")
+	flag.DurationVar(&config.CheckInterval, "interval", 60*time.Second, "Check interval for continuous monitoring")
 	flag.IntVar(&config.MetricsPort, "metrics-port", 8080, "Prometheus metrics port")
-	flag.StringVar(&config.OutputFile, "output", "", "Output file for health and cost reports")
-	flag.BoolVar(&config.EnableCostReport, "cost", true, "Enable cost reporting")
-	flag.StringVar(&config.PricingDataFile, "pricing", "pricing.json", "Pricing data file")
+	flag.DurationVar(&config.MetricsReadHeaderTimeout, "metrics-read-header-timeout", 5*time.Second, "Read header timeout for metrics server")
+	flag.DurationVar(&config.RequestTimeout, "request-timeout", 30*time.Second, "Timeout for a single report cycle")
+	flag.DurationVar(&config.ShutdownTimeout, "shutdown-timeout", 10*time.Second, "Graceful shutdown timeout")
+	flag.BoolVar(&config.EnableDetailedMetrics, "enable-detailed-metrics", false, "Enable namespace/phase metrics (top namespaces only)")
+	flag.IntVar(&config.MetricsTopNamespaces, "metrics-top-namespaces", 10, "Max namespaces to export metrics for (others aggregated)")
+	flag.DurationVar(&config.DetailedMetricsInterval, "detailed-metrics-interval", 5*time.Minute, "Interval for detailed metrics collection")
+	flag.BoolVar(&config.PricingDebug, "pricing-debug", false, "Enable debug logging for pricing providers")
+	flag.StringVar(&config.PricingDebugLogPath, "pricing-debug-log", "pricing-debug.log", "File path for pricing debug logs")
+	flag.BoolVar(&config.OneShot, "one-shot", false, "Run once and exit")
+	flag.StringVar(&config.ReportType, "type", "combined", "Report type (health, cost, combined)")
 
 	flag.Parse()
 	return config
 }
 
-func startMetricsServer(port int) {
-	http.Handle("/metrics", promhttp.Handler())
+func startMetricsServer(port int, readHeaderTimeout time.Duration) *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+
+	server := &http.Server{
+		Addr:              fmt.Sprintf(":%d", port),
+		Handler:           mux,
+		ReadHeaderTimeout: readHeaderTimeout,
+	}
+
 	go func() {
 		log.Printf("Starting metrics server on port %d", port)
-		if err := http.ListenAndServe(fmt.Sprintf(":%d", port), nil); err != nil {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Failed to start metrics server: %v", err)
 		}
 	}()
+
+	return server
 }
 
-func loadPricingData(filename string) *PricingData {
-	if _, err := os.Stat(filename); os.IsNotExist(err) {
-		// Create default pricing data if file doesn't exist
-		pricingData := &PricingData{
-			Nodes: map[string]NodePricing{
-				"default": {
-					CPUCostPerHour:     0.03,
-					MemoryCostPerGBHr:  0.004,
-					StorageCostPerGBHr: 0.00012,
-					RegionMultiplier:   1.0,
-				},
-				"highcpu": {
-					CPUCostPerHour:     0.05,
-					MemoryCostPerGBHr:  0.003,
-					StorageCostPerGBHr: 0.00015,
-					RegionMultiplier:   1.0,
-				},
-				"highmem": {
-					CPUCostPerHour:     0.02,
-					MemoryCostPerGBHr:  0.006,
-					StorageCostPerGBHr: 0.0001,
-					RegionMultiplier:   1.0,
-				},
-			},
-		}
-
-		// Write default pricing data to file
-		data, err := json.MarshalIndent(pricingData, "", "  ")
-		if err != nil {
-			log.Fatalf("Failed to marshal pricing data: %v", err)
-		}
-
-		if err := os.WriteFile(filename, data, 0644); err != nil {
-			log.Fatalf("Failed to write pricing data: %v", err)
-		}
-
-		log.Printf("Created default pricing data file: %s", filename)
-		return pricingData
+func runWithTimeout(parentCtx context.Context, timeout time.Duration, run func(context.Context) error) error {
+	if timeout <= 0 {
+		return run(parentCtx)
 	}
-
-	// Load pricing data from file
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		log.Fatalf("Failed to read pricing data: %v", err)
-	}
-
-	var pricingData PricingData
-	if err := json.Unmarshal(data, &pricingData); err != nil {
-		log.Fatalf("Failed to parse pricing data: %v", err)
-	}
-
-	return &pricingData
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
+	defer cancel()
+	return run(ctx)
 }
 
-func initKubernetesClient(kubeConfigPath string) (*kubernetes.Clientset, *versioned.Clientset) {
+func initKubernetesClients(kubeConfigPath string) (*kubernetes.Clientset, *metricsv.Clientset) {
 	var config *rest.Config
 	var err error
 
-	// Try to use in-cluster config first
 	config, err = rest.InClusterConfig()
 	if err != nil {
-		// Fall back to kubeconfig file
 		config, err = clientcmd.BuildConfigFromFlags("", kubeConfigPath)
 		if err != nil {
 			log.Fatalf("Failed to create Kubernetes config: %v", err)
 		}
 	}
 
-	// Create clientset for Kubernetes API
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		log.Fatalf("Failed to create Kubernetes client: %v", err)
 	}
 
-	// Create clientset for Metrics API
-	metricsClient, err := versioned.NewForConfig(config)
+	metricsClient, err := metricsv.NewForConfig(config)
 	if err != nil {
 		log.Fatalf("Failed to create Metrics client: %v", err)
 	}
@@ -285,395 +282,191 @@ func initKubernetesClient(kubeConfigPath string) (*kubernetes.Clientset, *versio
 	return clientset, metricsClient
 }
 
-func checkClusterHealth(clientset *kubernetes.Clientset) *ClusterHealth {
-	ctx := context.Background()
-	health := &ClusterHealth{}
-
-	// Check nodes status
-	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+func resolvePricing(ctx context.Context, configPath string, debug bool, debugLogPath string) (map[string]cost.ResourcePricing, error) {
+	configData, err := apppricing.LoadConfig(configPath)
 	if err != nil {
-		log.Printf("Failed to list nodes: %v", err)
-		return health
+		return nil, err
 	}
+	configData = applyProviderEnvOverrides(configData)
 
-	health.TotalNodes = len(nodes.Items)
-
-	for _, node := range nodes.Items {
-		for _, condition := range node.Status.Conditions {
-			if condition.Type == v1.NodeReady && condition.Status == v1.ConditionTrue {
-				health.ReadyNodes++
-			}
-			if condition.Type == v1.NodeMemoryPressure && condition.Status == v1.ConditionTrue {
-				health.MemoryPressureNodes++
-			}
-			if condition.Type == v1.NodeDiskPressure && condition.Status == v1.ConditionTrue {
-				health.DiskPressureNodes++
-			}
-			if condition.Type == v1.NodePIDPressure && condition.Status == v1.ConditionTrue {
-				health.PIDPressureNodes++
-			}
-			if condition.Type == v1.NodeNetworkUnavailable && condition.Status == v1.ConditionTrue {
-				health.NetworkUnavailableNodes++
-			}
+	var debugLogger *log.Logger
+	var debugFile *os.File
+	if debug {
+		path := strings.TrimSpace(debugLogPath)
+		if path == "" {
+			path = "pricing-debug.log"
 		}
+		debugFile, err = os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return nil, fmt.Errorf("open pricing debug log: %w", err)
+		}
+		debugLogger = log.New(debugFile, "", log.LstdFlags|log.LUTC)
+	}
+	if debugFile != nil {
+		defer debugFile.Close()
 	}
 
-	// Check pod status
+	providers := make([]portspricing.Provider, 0)
+	staticProvider := staticp.New(configData.InstanceTypes, configData.Providers.AWS.Region, configData.Providers.AWS.Currency)
+	providers = append(providers, staticProvider)
+
+	azureProvider := azurep.New(nil, debug, debugLogger)
+	providers = append(providers, azureProvider)
+
+	if configData.Providers.GCP.APIKey != "" {
+		gcpProvider := gcpp.New(nil, configData.Providers.GCP.APIKey, debug, debugLogger)
+		providers = append(providers, gcpProvider)
+	}
+
+	awsProvider, err := awsp.New(ctx, debug, debugLogger)
+	if err == nil {
+		providers = append(providers, awsProvider)
+	}
+
+	service := apppricing.NewService(providers)
+	return service.Resolve(ctx, configData)
+}
+
+func applyProviderEnvOverrides(cfg domainpricing.Config) domainpricing.Config {
+	if value := os.Getenv("K8S_MONITOR_GCP_API_KEY"); value != "" {
+		cfg.Providers.GCP.APIKey = value
+	}
+	return cfg
+}
+
+func generateReport(
+	ctx context.Context,
+	clientset *kubernetes.Clientset,
+	metricsClient *metricsv.Clientset,
+	pricing map[string]cost.ResourcePricing,
+	config *Config,
+) error {
+	var output io.Writer = os.Stdout
+	if config.ReportPath != "" {
+		file, err := os.Create(config.ReportPath)
+		if err != nil {
+			return fmt.Errorf("failed to create output file: %w", err)
+		}
+		defer file.Close()
+		output = file
+	}
+
+	generator := reportingadapter.NewGenerator(clientset, metricsClient, config.ReportFormat, output)
+	service := appreporting.NewService(generator)
+	return service.Generate(ctx, config.ReportType, pricing)
+}
+
+func executeReportCycle(
+	ctx context.Context,
+	clientset *kubernetes.Clientset,
+	metricsClient *metricsv.Clientset,
+	pricing map[string]cost.ResourcePricing,
+	config *Config,
+) error {
+	start := time.Now()
+	status := "success"
+	err := generateReport(ctx, clientset, metricsClient, pricing, config)
+	if err != nil {
+		status = "error"
+	}
+
+	reportRunDuration.WithLabelValues(config.ReportType, status).Observe(time.Since(start).Seconds())
+	reportRunTotal.WithLabelValues(config.ReportType, status).Inc()
+	if status == "success" {
+		reportLastSuccessTimestamp.WithLabelValues(config.ReportType).Set(float64(time.Now().Unix()))
+	}
+
+	return err
+}
+
+func updateDetailedMetrics(ctx context.Context, clientset *kubernetes.Clientset, topNamespaces int) error {
+	if topNamespaces <= 0 {
+		topNamespaces = 10
+	}
+
 	pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
 	if err != nil {
-		log.Printf("Failed to list pods: %v", err)
-		return health
+		return fmt.Errorf("list pods for metrics: %w", err)
 	}
+
+	phaseTotals := map[string]float64{}
+	perNamespace := map[string]map[string]float64{}
+	perNamespaceTotal := map[string]float64{}
 
 	for _, pod := range pods.Items {
-		switch pod.Status.Phase {
-		case v1.PodPending:
-			health.PendingPods++
-		case v1.PodFailed:
-			health.FailedPods++
+		phase := string(pod.Status.Phase)
+		if phase == "" {
+			phase = "Unknown"
 		}
+		phaseTotals[phase]++
+
+		ns := pod.Namespace
+		if _, ok := perNamespace[ns]; !ok {
+			perNamespace[ns] = map[string]float64{}
+		}
+		perNamespace[ns][phase]++
+		perNamespaceTotal[ns]++
 	}
 
-	// Check critical components in kube-system
-	criticalNamespaces := []string{"kube-system", "kube-public"}
-	health.CriticalComponentsOK = true
+	for phase, count := range phaseTotals {
+		podPhaseTotal.WithLabelValues(phase).Set(count)
+	}
 
-	for _, namespace := range criticalNamespaces {
-		namespacePods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			log.Printf("Failed to list pods in %s: %v", namespace, err)
-			health.CriticalComponentsOK = false
+	topList := topNamespaceList(perNamespaceTotal, topNamespaces)
+	allowed := map[string]struct{}{}
+	for _, ns := range topList {
+		allowed[ns] = struct{}{}
+	}
+
+	// Reset namespace vectors to avoid stale series from previous intervals
+	namespacePodPhaseTotal.Reset()
+	namespacePodTotal.Reset()
+
+	otherPhaseTotals := map[string]float64{}
+	var otherTotal float64
+
+	for ns, phaseMap := range perNamespace {
+		if _, ok := allowed[ns]; ok {
+			for phase, count := range phaseMap {
+				namespacePodPhaseTotal.WithLabelValues(ns, phase).Set(count)
+			}
+			namespacePodTotal.WithLabelValues(ns).Set(perNamespaceTotal[ns])
 			continue
 		}
-
-		for _, pod := range namespacePods.Items {
-			if pod.Status.Phase != v1.PodRunning {
-				health.CriticalComponentsOK = false
-				log.Printf("Critical component not running: %s/%s", namespace, pod.Name)
-			}
+		for phase, count := range phaseMap {
+			otherPhaseTotals[phase] += count
 		}
+		otherTotal += perNamespaceTotal[ns]
 	}
 
-	// Calculate resource utilization (simplified - would be more detailed with metrics-server data)
-	if health.TotalNodes > 0 {
-		health.ResourceUtilization = float64(len(pods.Items)) / float64(health.TotalNodes*110) * 100 // Assuming ~100 pods per node is "full"
+	if otherTotal > 0 {
+		for phase, count := range otherPhaseTotals {
+			namespacePodPhaseTotal.WithLabelValues("other", phase).Set(count)
+		}
+		namespacePodTotal.WithLabelValues("other").Set(otherTotal)
 	}
 
-	return health
+	return nil
 }
 
-func generateCostReport(clientset *kubernetes.Clientset, metricsClient *versioned.Clientset, pricingData *PricingData) *CostReport {
-	ctx := context.Background()
-	costReport := &CostReport{
-		CostByNamespace: make(map[string]float64),
-		CostByNodeType:  make(map[string]float64),
-		Recommendations: make([]CostOptimizationRec, 0),
+func topNamespaceList(counts map[string]float64, limit int) []string {
+	type pair struct {
+		name  string
+		count float64
 	}
-
-	// Get nodes info
-	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		log.Printf("Failed to list nodes: %v", err)
-		return costReport
+	items := make([]pair, 0, len(counts))
+	for name, count := range counts {
+		items = append(items, pair{name: name, count: count})
 	}
-
-	// Calculate cost by node type
-	for _, node := range nodes.Items {
-		nodeType := "default"
-		if t, ok := node.Labels["node.kubernetes.io/instance-type"]; ok {
-			nodeType = t
-		}
-
-		// Find pricing for this node type, or use default
-		pricing := pricingData.Nodes["default"]
-		if p, ok := pricingData.Nodes[nodeType]; ok {
-			pricing = p
-		}
-
-		// Calculate CPU capacity
-		cpuCapacity := float64(node.Status.Capacity.Cpu().Value())
-		cpuCost := cpuCapacity * pricing.CPUCostPerHour
-
-		// Calculate memory capacity in GB
-		memCapacity := float64(node.Status.Capacity.Memory().Value()) / (1024 * 1024 * 1024)
-		memCost := memCapacity * pricing.MemoryCostPerGBHr
-
-		// Apply region multiplier from pricing data
-		nodeCost := (cpuCost + memCost) * pricing.RegionMultiplier
-
-		if _, ok := costReport.CostByNodeType[nodeType]; !ok {
-			costReport.CostByNodeType[nodeType] = 0
-		}
-		costReport.CostByNodeType[nodeType] += nodeCost
-		costReport.TotalCostPerHour += nodeCost
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].count > items[j].count
+	})
+	if limit > len(items) {
+		limit = len(items)
 	}
-
-	// Get pods info
-	pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		log.Printf("Failed to list pods: %v", err)
-		return costReport
+	result := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		result = append(result, items[i].name)
 	}
-
-	// Create map to store namespace usage
-	namespaceCPURequests := make(map[string]float64)
-	namespaceMemRequests := make(map[string]float64)
-	namespaceCPULimits := make(map[string]float64)
-	namespaceMemLimits := make(map[string]float64)
-
-	// Calculate usage by namespace
-	for _, pod := range pods.Items {
-		namespace := pod.Namespace
-
-		if _, ok := namespaceCPURequests[namespace]; !ok {
-			namespaceCPURequests[namespace] = 0
-			namespaceMemRequests[namespace] = 0
-			namespaceCPULimits[namespace] = 0
-			namespaceMemLimits[namespace] = 0
-		}
-
-		// Sum up resource requests and limits
-		for _, container := range pod.Spec.Containers {
-			if container.Resources.Requests != nil {
-				namespaceCPURequests[namespace] += float64(container.Resources.Requests.Cpu().MilliValue()) / 1000
-				namespaceMemRequests[namespace] += float64(container.Resources.Requests.Memory().Value()) / (1024 * 1024 * 1024)
-			}
-
-			if container.Resources.Limits != nil {
-				namespaceCPULimits[namespace] += float64(container.Resources.Limits.Cpu().MilliValue()) / 1000
-				namespaceMemLimits[namespace] += float64(container.Resources.Limits.Memory().Value()) / (1024 * 1024 * 1024)
-			}
-		}
-	}
-
-	// Calculate cost by namespace
-	totalClusterCPU := 0.0
-	totalClusterMem := 0.0
-
-	for _, node := range nodes.Items {
-		totalClusterCPU += float64(node.Status.Capacity.Cpu().Value())
-		totalClusterMem += float64(node.Status.Capacity.Memory().Value()) / (1024 * 1024 * 1024)
-	}
-
-	// Distribute cost to namespaces based on resource requests
-	for namespace, cpuRequests := range namespaceCPURequests {
-		cpuCostShare := 0.0
-		memCostShare := 0.0
-
-		if totalClusterCPU > 0 {
-			cpuCostShare = cpuRequests / totalClusterCPU * costReport.TotalCostPerHour * 0.7 // Assuming CPU is 70% of cost
-		}
-
-		if totalClusterMem > 0 {
-			memCostShare = namespaceMemRequests[namespace] / totalClusterMem * costReport.TotalCostPerHour * 0.3 // Assuming memory is 30% of cost
-		}
-
-		costReport.CostByNamespace[namespace] = cpuCostShare + memCostShare
-
-		// Generate optimization recommendations
-		generateOptimizationRecs(namespace, cpuRequests, namespaceMemRequests[namespace],
-			namespaceCPULimits[namespace], namespaceMemLimits[namespace], costReport)
-	}
-
-	// Calculate monthly cost projection
-	costReport.TotalCostPerMonth = costReport.TotalCostPerHour * 24 * 30
-
-	return costReport
-}
-
-func generateOptimizationRecs(namespace string, cpuReq, memReq, cpuLimit, memLimit float64, costReport *CostReport) {
-	// Check for missing resource requests
-	if cpuReq == 0 && memReq == 0 {
-		costReport.Recommendations = append(costReport.Recommendations, CostOptimizationRec{
-			Type:        "Resource Requests",
-			Resource:    "CPU/Memory",
-			Namespace:   namespace,
-			Description: "Missing resource requests, could lead to scheduling issues",
-			Savings:     0,
-		})
-	}
-
-	// Check for over-provisioned resources (large difference between requests and limits)
-	if cpuLimit > 0 && cpuReq > 0 && cpuLimit/cpuReq > 4 {
-		cpuSavings := (cpuLimit/cpuReq - 2) * cpuReq * 0.03 * 24 * 30 // Assuming $0.03 per CPU hour
-		costReport.Recommendations = append(costReport.Recommendations, CostOptimizationRec{
-			Type:        "Resource Optimization",
-			Resource:    "CPU",
-			Namespace:   namespace,
-			Description: fmt.Sprintf("CPU limits are %.1fx higher than requests", cpuLimit/cpuReq),
-			Savings:     cpuSavings,
-		})
-	}
-
-	if memLimit > 0 && memReq > 0 && memLimit/memReq > 3 {
-		memSavings := (memLimit/memReq - 1.5) * memReq * 0.004 * 24 * 30 // Assuming $0.004 per GB hour
-		costReport.Recommendations = append(costReport.Recommendations, CostOptimizationRec{
-			Type:        "Resource Optimization",
-			Resource:    "Memory",
-			Namespace:   namespace,
-			Description: fmt.Sprintf("Memory limits are %.1fx higher than requests", memLimit/memReq),
-			Savings:     memSavings,
-		})
-	}
-
-	// Check for efficient workloads
-	if cpuReq > 0 && memReq > 0 && cpuLimit > 0 && memLimit > 0 {
-		if cpuLimit/cpuReq <= 2 && memLimit/memReq <= 2 {
-			costReport.EfficientWorkloads = append(costReport.EfficientWorkloads, namespace)
-		}
-	}
-}
-
-func updateMetrics(clientset *kubernetes.Clientset, metricsClient *versioned.Clientset) {
-	ctx := context.Background()
-
-	// Update node status metrics
-	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		log.Printf("Failed to list nodes for metrics: %v", err)
-		return
-	}
-
-	for _, node := range nodes.Items {
-		isReady := 0.0
-		for _, condition := range node.Status.Conditions {
-			if condition.Type == v1.NodeReady && condition.Status == v1.ConditionTrue {
-				isReady = 1.0
-				break
-			}
-		}
-		nodeStatusGauge.WithLabelValues(node.Name).Set(isReady)
-	}
-
-	// Update pod status metrics
-	pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		log.Printf("Failed to list pods for metrics: %v", err)
-		return
-	}
-
-	for _, pod := range pods.Items {
-		var statusValue float64
-
-		switch pod.Status.Phase {
-		case v1.PodRunning:
-			statusValue = 2.0
-		case v1.PodPending:
-			statusValue = 1.0
-		case v1.PodFailed:
-			statusValue = 0.0
-		case v1.PodSucceeded:
-			statusValue = 3.0
-		default:
-			statusValue = -1.0
-		}
-
-		podStatusGauge.WithLabelValues(pod.Namespace, pod.Name).Set(statusValue)
-	}
-
-	// Aggregate resource usage by namespace
-	namespaceCPUUsage := make(map[string]float64)
-	namespaceMemUsage := make(map[string]float64)
-	namespaceCPURequests := make(map[string]float64)
-	namespaceMemRequests := make(map[string]float64)
-
-	for _, pod := range pods.Items {
-		namespace := pod.Namespace
-
-		if _, ok := namespaceCPUUsage[namespace]; !ok {
-			namespaceCPUUsage[namespace] = 0
-			namespaceMemUsage[namespace] = 0
-			namespaceCPURequests[namespace] = 0
-			namespaceMemRequests[namespace] = 0
-		}
-
-		// Sum resource requests
-		for _, container := range pod.Spec.Containers {
-			if container.Resources.Requests != nil {
-				cpuReq := float64(container.Resources.Requests.Cpu().MilliValue()) / 1000
-				memReq := float64(container.Resources.Requests.Memory().Value()) / (1024 * 1024 * 1024)
-
-				namespaceCPURequests[namespace] += cpuReq
-				namespaceMemRequests[namespace] += memReq
-			}
-		}
-	}
-
-	// Update namespace resource usage metrics
-	for namespace, cpuUsage := range namespaceCPUUsage {
-		namespaceResourceUsageGauge.WithLabelValues(namespace, "cpu").Set(cpuUsage)
-		namespaceResourceUsageGauge.WithLabelValues(namespace, "memory").Set(namespaceMemUsage[namespace])
-
-		// Update resource efficiency metrics if we have both usage and requests
-		if namespaceCPURequests[namespace] > 0 {
-			cpuEfficiency := cpuUsage / namespaceCPURequests[namespace]
-			resourceEfficiencyGauge.WithLabelValues(namespace, "cpu").Set(cpuEfficiency)
-		}
-
-		if namespaceMemRequests[namespace] > 0 {
-			memEfficiency := namespaceMemUsage[namespace] / namespaceMemRequests[namespace]
-			resourceEfficiencyGauge.WithLabelValues(namespace, "memory").Set(memEfficiency)
-		}
-	}
-}
-
-func outputResults(filename string, health *ClusterHealth, costReport *CostReport) {
-	output := struct {
-		Timestamp  string         `json:"timestamp"`
-		Health     *ClusterHealth `json:"health"`
-		CostReport *CostReport    `json:"costReport,omitempty"`
-	}{
-		Timestamp:  time.Now().Format(time.RFC3339),
-		Health:     health,
-		CostReport: costReport,
-	}
-
-	data, err := json.MarshalIndent(output, "", "  ")
-	if err != nil {
-		log.Printf("Failed to marshal output: %v", err)
-		return
-	}
-
-	if err := os.WriteFile(filename, data, 0644); err != nil {
-		log.Printf("Failed to write output: %v", err)
-	}
-}
-
-func printSummary(health *ClusterHealth, costReport *CostReport) {
-	fmt.Println("=== Kubernetes Health and Cost Management Summary ===")
-	fmt.Printf("Time: %s\n\n", time.Now().Format(time.RFC3339))
-
-	fmt.Println("--- Cluster Health ---")
-	fmt.Printf("Nodes: %d total, %d ready\n", health.TotalNodes, health.ReadyNodes)
-	fmt.Printf("Resource Utilization: %.1f%%\n", health.ResourceUtilization)
-	fmt.Printf("Pod Issues: %d pending, %d failed\n", health.PendingPods, health.FailedPods)
-	fmt.Printf("Critical Components: %v\n", health.CriticalComponentsOK)
-	fmt.Printf("Pressure Conditions: %d memory, %d disk, %d PID, %d network\n",
-		health.MemoryPressureNodes, health.DiskPressureNodes, health.PIDPressureNodes, health.NetworkUnavailableNodes)
-
-	if costReport != nil {
-		fmt.Println("\n--- Cost Report ---")
-		fmt.Printf("Total Cost: $%.2f/hour, $%.2f/month\n", costReport.TotalCostPerHour, costReport.TotalCostPerMonth)
-
-		fmt.Println("\nTop 5 Namespace Costs:")
-		count := 0
-		for namespace, cost := range costReport.CostByNamespace {
-			fmt.Printf("  %s: $%.2f/hour\n", namespace, cost)
-			count++
-			if count >= 5 {
-				break
-			}
-		}
-
-		fmt.Println("\nCost Recommendations:")
-		for i, rec := range costReport.Recommendations {
-			if i >= 3 {
-				break
-			}
-			fmt.Printf("  [%s/%s] %s - Potential savings: $%.2f/month\n",
-				rec.Namespace, rec.Resource, rec.Description, rec.Savings)
-		}
-	}
-
-	fmt.Println("\n=====================================================")
+	return result
 }
