@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"time"
-	"math"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -200,7 +200,6 @@ func checkNodeHealth(ctx context.Context, clientset *kubernetes.Clientset, statu
 	totalLoad := 0.0
 
 	for _, node := range nodes.Items {
-		isReady := false
 		nodeConditions := make([]string, 0)
 
 		for _, condition := range node.Status.Conditions {
@@ -209,7 +208,6 @@ func checkNodeHealth(ctx context.Context, clientset *kubernetes.Clientset, statu
 
 				switch condition.Type {
 				case v1.NodeReady:
-					isReady = true
 					status.ReadyNodes++
 				case v1.NodeMemoryPressure:
 					status.MemoryPressureNodes++
@@ -923,5 +921,4 @@ func calculateHealthScore(h *ClusterHealth) int {
 		score = 100
 	}
 	return int(math.Round(score))
-}
 }

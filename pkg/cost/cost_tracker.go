@@ -52,11 +52,12 @@ type NamespaceCostData struct {
 
 // ResourcePricing contains pricing information for a resource
 type ResourcePricing struct {
-	CPU        float64 // per core hour
-	Memory     float64 // per GB hour
-	Storage    float64 // per GB hour
-	Network    float64 // per GB
-	GPUPricing map[string]float64
+	CPU          float64 // per core hour
+	Memory       float64 // per GB hour
+	Storage      float64 // per GB hour
+	Network      float64 // per GB
+	TotalPerHour float64 // total per hour for the instance
+	GPUPricing   map[string]float64
 }
 
 // GetNodeCosts calculates costs for all nodes in the cluster
@@ -82,6 +83,9 @@ func GetNodeCosts(
 			Labels:       node.Labels,
 		}
 
+		cpuCapacity := float64(node.Status.Capacity.Cpu().Value())
+		memCapacity := float64(node.Status.Capacity.Memory().Value()) / (1024 * 1024 * 1024)
+
 		// Determine which pricing to use based on instance type
 		resourcePricing := pricing["default"]
 		if p, ok := pricing[nodeData.InstanceType]; ok {
@@ -89,24 +93,31 @@ func GetNodeCosts(
 		}
 
 		// Calculate CPU cost
-		cpuCapacity := float64(node.Status.Capacity.Cpu().Value())
-		nodeData.CPUCost = cpuCapacity * resourcePricing.CPU
+		if resourcePricing.TotalPerHour > 0 {
+			nodeData.TotalCost = resourcePricing.TotalPerHour
+			if resourcePricing.CPU > 0 || resourcePricing.Memory > 0 || resourcePricing.Storage > 0 {
+				nodeData.CPUCost = resourcePricing.CPU
+				nodeData.MemoryCost = resourcePricing.Memory
+				nodeData.StorageCost = resourcePricing.Storage
+			} else {
+				nodeData.CPUCost = resourcePricing.TotalPerHour
+				nodeData.MemoryCost = 0
+				nodeData.StorageCost = 0
+			}
+		} else {
+			nodeData.CPUCost = cpuCapacity * resourcePricing.CPU
+			nodeData.MemoryCost = memCapacity * resourcePricing.Memory
 
-		// Calculate memory cost (convert to GB)
-		memCapacity := float64(node.Status.Capacity.Memory().Value()) / (1024 * 1024 * 1024)
-		nodeData.MemoryCost = memCapacity * resourcePricing.Memory
+			var storageCapacity float64
+			for range node.Status.VolumesAttached {
+				// In a real implementation, we would get actual PV sizes
+				// This is a simplified version
+				storageCapacity += 100 // Assume 100GB per attached volume
+			}
+			nodeData.StorageCost = storageCapacity * resourcePricing.Storage
 
-		// Calculate storage cost
-		var storageCapacity float64
-		for _, fs := range node.Status.VolumesAttached {
-			// In a real implementation, we would get actual PV sizes
-			// This is a simplified version
-			storageCapacity += 100 // Assume 100GB per attached volume
+			nodeData.TotalCost = nodeData.CPUCost + nodeData.MemoryCost + nodeData.StorageCost
 		}
-		nodeData.StorageCost = storageCapacity * resourcePricing.Storage
-
-		// Calculate total cost
-		nodeData.TotalCost = nodeData.CPUCost + nodeData.MemoryCost + nodeData.StorageCost
 
 		// Calculate utilization and pod count (simplified)
 		pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
