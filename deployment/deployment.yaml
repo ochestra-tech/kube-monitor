@@ -1,26 +1,27 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ochestra-ai
+  name: k8s-monitor
   namespace: monitoring
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: ochestra-ai
+      app: k8s-monitor
   template:
     metadata:
       labels:
-        app: ochestra-ai
+        app: k8s-monitor
     spec:
-      serviceAccountName: ochestra-ai
+      serviceAccountName: k8s-monitor
       containers:
-      - name: ochestra-ai
-        image: your-registry/ochestra-ai:latest
+      - name: k8s-monitor
+        image: your-registry/k8s-monitor:latest
         args:
           - "--interval=5m"
           - "--metrics-port=8080"
           - "--type=combined"
+          - "--pricing-config=/app/configs/pricing-config.json"
         ports:
         - containerPort: 8080
           name: metrics

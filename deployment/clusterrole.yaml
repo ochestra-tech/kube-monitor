@@ -1,7 +1,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: ochestra-ai
+  name: k8s-monitor
 rules:
 - apiGroups: [""]
   resources: ["nodes", "pods", "namespaces", "services", "endpoints", "configmaps"]
