@@ -2,6 +2,9 @@
 
 A comprehensive Go-based tool for monitoring Kubernetes cluster health and managing costs. This tool provides real-time health assessments, cost tracking, optimization recommendations, and detailed reporting for Kubernetes environments.
 
+See the detailed user guide: [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
+See the SRE/Cluster Admin guide: [docs/OPS_GUIDE.md](docs/OPS_GUIDE.md)
+
 ## Features
 
 ### 🏥 Health Monitoring
@@ -34,7 +37,7 @@ A comprehensive Go-based tool for monitoring Kubernetes cluster health and manag
 ## Installation
 
 ### Prerequisites
-- Go 1.19 or later
+- Go 1.24 or later
 - Access to a Kubernetes cluster
 - `kubectl` configured with cluster access
 - (Optional) Metrics Server deployed in the cluster for detailed resource usage
@@ -50,7 +53,7 @@ cd k8s-monitor
 go mod tidy
 
 # Build the application
-go build -o k8s-monitor ./cmd/main.go
+go build -o k8s-monitor ./cmd
 ```
 
 ### Dependencies
@@ -76,10 +79,12 @@ The tool uses your existing kubeconfig file. By default, it looks for `~/.kube/c
 ```
 
 ### Pricing Configuration
-Create a `pricing-config.json` file to define your cloud pricing:
+Create a pricing configuration file (default path is `configs/pricing-config.json`) to define your cloud pricing. You can set `source` to `static`, `aws`, `azure`, `gcp`, or `auto`. Region multipliers are applied to provider prices. For GCP, you can also set `K8S_MONITOR_GCP_API_KEY` as an environment variable.
 
 ```json
 {
+  "source": "static",
+  "cacheTtl": "6h",
   "defaults": {
     "cpu": 0.03,
     "memory": 0.004,
@@ -109,6 +114,27 @@ Create a `pricing-config.json` file to define your cloud pricing:
     "us-west-2": 1.05,
     "eu-west-1": 1.1,
     "ap-southeast-1": 1.15
+  },
+  "providers": {
+    "aws": {
+      "region": "us-east-1",
+      "currency": "USD",
+      "operatingSystem": "Linux",
+      "tenancy": "Shared"
+    },
+    "azure": {
+      "region": "eastus",
+      "currency": "USD"
+    },
+    "gcp": {
+      "region": "us-central1",
+      "currency": "USD",
+      "apiKey": ""
+    }
+  },
+  "retry": {
+    "attempts": 3,
+    "backoff": "1s"
   }
 }
 ```
@@ -163,12 +189,18 @@ Create a `pricing-config.json` file to define your cloud pricing:
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--kubeconfig` | Path to kubeconfig file | `~/.kube/config` |
-| `--pricing-config` | Path to pricing configuration | `pricing-config.json` |
+| `--pricing-config` | Path to pricing configuration | `configs/pricing-config.json` |
 | `--type` | Report type (health, cost, combined) | `combined` |
 | `--format` | Output format (text, json, html) | `text` |
 | `--output` | Output file path (empty for stdout) | `` |
 | `--interval` | Check interval for continuous monitoring | `60s` |
 | `--metrics-port` | Prometheus metrics port | `8080` |
+| `--metrics-read-header-timeout` | Metrics server read header timeout | `5s` |
+| `--request-timeout` | Per-report timeout | `30s` |
+| `--shutdown-timeout` | Graceful shutdown timeout | `10s` |
+| `--enable-detailed-metrics` | Enable namespace/phase metrics | `false` |
+| `--metrics-top-namespaces` | Max namespaces in metrics | `10` |
+| `--detailed-metrics-interval` | Detailed metrics refresh interval | `5m` |
 | `--one-shot` | Run once and exit | `false` |
 
 ## API and Programming Interface
