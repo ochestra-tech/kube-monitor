@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -144,7 +147,7 @@ func main() {
 		return
 	}
 
-	metricsServer := startMetricsServer(config.MetricsPort, config.MetricsReadHeaderTimeout)
+	metricsServer := startMetricsServer(config, clientset, metricsClient, pricing)
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
 		defer cancel()
@@ -212,9 +215,9 @@ func parseFlags() *Config {
 	flag.StringVar((*string)(&config.ReportFormat), "format", string(reports.FormatText), "Report format (text, json, html)")
 	flag.StringVar(&config.ReportPath, "output", "", "Output file path (empty for stdout)")
 	flag.DurationVar(&config.CheckInterval, "interval", 60*time.Second, "Check interval for continuous monitoring")
-	flag.IntVar(&config.MetricsPort, "metrics-port", 8080, "Prometheus metrics port")
+	flag.IntVar(&config.MetricsPort, "metrics-port", 8084, "Prometheus metrics port")
 	flag.DurationVar(&config.MetricsReadHeaderTimeout, "metrics-read-header-timeout", 5*time.Second, "Read header timeout for metrics server")
-	flag.DurationVar(&config.RequestTimeout, "request-timeout", 30*time.Second, "Timeout for a single report cycle")
+	flag.DurationVar(&config.RequestTimeout, "request-timeout", 90*time.Second, "Timeout for a single report cycle")
 	flag.DurationVar(&config.ShutdownTimeout, "shutdown-timeout", 10*time.Second, "Graceful shutdown timeout")
 	flag.BoolVar(&config.EnableDetailedMetrics, "enable-detailed-metrics", false, "Enable namespace/phase metrics (top namespaces only)")
 	flag.IntVar(&config.MetricsTopNamespaces, "metrics-top-namespaces", 10, "Max namespaces to export metrics for (others aggregated)")
@@ -228,24 +231,98 @@ func parseFlags() *Config {
 	return config
 }
 
-func startMetricsServer(port int, readHeaderTimeout time.Duration) *http.Server {
+func startMetricsServer(
+	config *Config,
+	clientset *kubernetes.Clientset,
+	metricsClient *metricsv.Clientset,
+	pricing map[string]cost.ResourcePricing,
+) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 
+	mux.Handle("/api/health", withCORS(reportHandler("health", clientset, metricsClient, pricing, config.RequestTimeout)))
+	mux.Handle("/api/cost", withCORS(reportHandler("cost", clientset, metricsClient, pricing, config.RequestTimeout)))
+	mux.Handle("/api/combined", withCORS(reportHandler("combined", clientset, metricsClient, pricing, config.RequestTimeout)))
+
 	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", port),
+		Addr:              fmt.Sprintf(":%d", config.MetricsPort),
 		Handler:           mux,
-		ReadHeaderTimeout: readHeaderTimeout,
+		ReadHeaderTimeout: config.MetricsReadHeaderTimeout,
 	}
 
 	go func() {
-		log.Printf("Starting metrics server on port %d", port)
+		log.Printf("Starting metrics server on port %d", config.MetricsPort)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Failed to start metrics server: %v", err)
 		}
 	}()
 
 	return server
+}
+
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func reportHandler(
+	reportType string,
+	clientset *kubernetes.Clientset,
+	metricsClient *metricsv.Clientset,
+	pricing map[string]cost.ResourcePricing,
+	timeout time.Duration,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+
+		var buf bytes.Buffer
+		generator := reportingadapter.NewGenerator(clientset, metricsClient, reports.FormatJSON, &buf)
+		service := appreporting.NewService(generator)
+		if err := service.Generate(ctx, reportType, pricing); err != nil {
+			status := http.StatusInternalServerError
+			payload := map[string]string{
+				"error":   fmt.Sprintf("failed to generate %s report", reportType),
+				"details": err.Error(),
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				status = http.StatusGatewayTimeout
+				payload["suggestion"] = "Increase --request-timeout or reduce report scope to avoid API throttling."
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			if encodeErr := json.NewEncoder(w).Encode(payload); encodeErr != nil {
+				log.Printf("Failed to write %s error response: %v", reportType, encodeErr)
+			}
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write(buf.Bytes()); err != nil {
+			log.Printf("Failed to write %s report response: %v", reportType, err)
+		}
+	}
 }
 
 func runWithTimeout(parentCtx context.Context, timeout time.Duration, run func(context.Context) error) error {

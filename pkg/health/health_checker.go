@@ -247,6 +247,8 @@ func checkPodHealth(ctx context.Context, clientset *kubernetes.Clientset, status
 	status.PodsPerNode = make(map[string]int)
 	status.CrashLoopingPods = make([]string, 0)
 
+	const restartRecentWindow = 15 * time.Minute
+
 	for _, pod := range pods.Items {
 		// Update pod count per node
 		nodeName := pod.Spec.NodeName
@@ -271,10 +273,20 @@ func checkPodHealth(ctx context.Context, clientset *kubernetes.Clientset, status
 			status.UnknownPods++
 		}
 
-		// Check for restarting pods
+		// Check for restarting pods (recent restarts per pod)
+		restartedRecently := false
 		for _, containerStatus := range pod.Status.ContainerStatuses {
-			if containerStatus.RestartCount > 5 {
-				status.RestartingPods++
+			if containerStatus.RestartCount > 0 {
+				if containerStatus.LastTerminationState.Terminated != nil {
+					finishedAt := containerStatus.LastTerminationState.Terminated.FinishedAt.Time
+					if time.Since(finishedAt) <= restartRecentWindow {
+						restartedRecently = true
+					}
+				}
+				if containerStatus.State.Waiting != nil &&
+					containerStatus.State.Waiting.Reason == "CrashLoopBackOff" {
+					restartedRecently = true
+				}
 			}
 
 			// Check for crash loop back off
@@ -283,6 +295,10 @@ func checkPodHealth(ctx context.Context, clientset *kubernetes.Clientset, status
 				podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
 				status.CrashLoopingPods = append(status.CrashLoopingPods, podKey)
 			}
+		}
+
+		if restartedRecently {
+			status.RestartingPods++
 		}
 	}
 
