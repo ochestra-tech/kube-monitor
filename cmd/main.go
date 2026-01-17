@@ -26,6 +26,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	metricsv "k8s.io/metrics/pkg/client/clientset/versioned"
 
+	cacheadapter "github.com/ochestra-tech/k8s-monitor/internal/adapters/cache"
 	awsp "github.com/ochestra-tech/k8s-monitor/internal/adapters/pricing/aws"
 	azurep "github.com/ochestra-tech/k8s-monitor/internal/adapters/pricing/azure"
 	gcpp "github.com/ochestra-tech/k8s-monitor/internal/adapters/pricing/gcp"
@@ -112,6 +113,8 @@ type Config struct {
 	MetricsReadHeaderTimeout time.Duration
 	RequestTimeout           time.Duration
 	ShutdownTimeout          time.Duration
+	KubeQPS                  float32
+	KubeBurst                int
 	EnableDetailedMetrics    bool
 	MetricsTopNamespaces     int
 	DetailedMetricsInterval  time.Duration
@@ -127,7 +130,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	clientset, metricsClient := initKubernetesClients(config.KubeConfigPath)
+	clientset, metricsClient := initKubernetesClients(config.KubeConfigPath, config.KubeQPS, config.KubeBurst)
 	pricing, err := resolvePricing(ctx, config.PricingConfigPath, config.PricingDebug, config.PricingDebugLogPath)
 	if err != nil {
 		log.Fatalf("Failed to resolve pricing: %v", err)
@@ -219,6 +222,9 @@ func parseFlags() *Config {
 	flag.DurationVar(&config.MetricsReadHeaderTimeout, "metrics-read-header-timeout", 5*time.Second, "Read header timeout for metrics server")
 	flag.DurationVar(&config.RequestTimeout, "request-timeout", 90*time.Second, "Timeout for a single report cycle")
 	flag.DurationVar(&config.ShutdownTimeout, "shutdown-timeout", 10*time.Second, "Graceful shutdown timeout")
+	kubeQPS := 20.0
+	flag.Float64Var(&kubeQPS, "kube-qps", 20, "Kubernetes client QPS (rate limiter)")
+	flag.IntVar(&config.KubeBurst, "kube-burst", 40, "Kubernetes client burst (rate limiter)")
 	flag.BoolVar(&config.EnableDetailedMetrics, "enable-detailed-metrics", false, "Enable namespace/phase metrics (top namespaces only)")
 	flag.IntVar(&config.MetricsTopNamespaces, "metrics-top-namespaces", 10, "Max namespaces to export metrics for (others aggregated)")
 	flag.DurationVar(&config.DetailedMetricsInterval, "detailed-metrics-interval", 5*time.Minute, "Interval for detailed metrics collection")
@@ -228,6 +234,7 @@ func parseFlags() *Config {
 	flag.StringVar(&config.ReportType, "type", "combined", "Report type (health, cost, combined)")
 
 	flag.Parse()
+	config.KubeQPS = float32(kubeQPS)
 	return config
 }
 
@@ -334,7 +341,7 @@ func runWithTimeout(parentCtx context.Context, timeout time.Duration, run func(c
 	return run(ctx)
 }
 
-func initKubernetesClients(kubeConfigPath string) (*kubernetes.Clientset, *metricsv.Clientset) {
+func initKubernetesClients(kubeConfigPath string, qps float32, burst int) (*kubernetes.Clientset, *metricsv.Clientset) {
 	var config *rest.Config
 	var err error
 
@@ -344,6 +351,13 @@ func initKubernetesClients(kubeConfigPath string) (*kubernetes.Clientset, *metri
 		if err != nil {
 			log.Fatalf("Failed to create Kubernetes config: %v", err)
 		}
+	}
+
+	if qps > 0 {
+		config.QPS = qps
+	}
+	if burst > 0 {
+		config.Burst = burst
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
@@ -400,7 +414,8 @@ func resolvePricing(ctx context.Context, configPath string, debug bool, debugLog
 		providers = append(providers, awsProvider)
 	}
 
-	service := apppricing.NewService(providers)
+	cacheStore := cacheadapter.NewFromEnv()
+	service := apppricing.NewService(providers, cacheStore)
 	return service.Resolve(ctx, configData)
 }
 
