@@ -137,7 +137,7 @@ func parseFlags() *Config {
 	flag.StringVar((*string)(&config.ReportFormat), "format", string(reports.FormatText), "Report format (text, json, html)")
 	flag.StringVar(&config.ReportPath, "output", "", "Output file path (empty for stdout)")
 	flag.DurationVar(&config.CheckInterval, "interval", 60*time.Second, "Check interval for continuous monitoring")
-	flag.IntVar(&config.MetricsPort, "metrics-port", 8080, "Prometheus metrics port")
+	flag.IntVar(&config.MetricsPort, "metrics-port", 8085, "Prometheus metrics port")
 	flag.BoolVar(&config.OneShot, "one-shot", false, "Run once and exit")
 	flag.StringVar(&config.ReportType, "type", "combined", "Report type (health, cost, combined)")
 

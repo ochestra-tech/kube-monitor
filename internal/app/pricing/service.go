@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
 
 	domain "github.com/ochestra-tech/k8s-monitor/internal/domain/pricing"
+	cacheports "github.com/ochestra-tech/k8s-monitor/internal/ports/cache"
 	ports "github.com/ochestra-tech/k8s-monitor/internal/ports/pricing"
 	"github.com/ochestra-tech/k8s-monitor/pkg/cost"
 )
@@ -17,16 +20,16 @@ import (
 // Service orchestrates pricing providers.
 type Service struct {
 	providers map[string]ports.Provider
-	cache     *cache
+	cache     cacheports.Store
 }
 
 // NewService creates a pricing service with provider registry.
-func NewService(providers []ports.Provider) *Service {
+func NewService(providers []ports.Provider, cacheStore cacheports.Store) *Service {
 	registry := make(map[string]ports.Provider)
 	for _, provider := range providers {
 		registry[provider.Name()] = provider
 	}
-	return &Service{providers: registry, cache: newCache()}
+	return &Service{providers: registry, cache: cacheStore}
 }
 
 // Resolve returns pricing data mapped to cost.ResourcePricing.
@@ -66,9 +69,17 @@ func (s *Service) Resolve(ctx context.Context, cfg domain.Config) (map[string]co
 		}
 
 		cacheKey := cacheKey(provider.Name(), providerReq)
-		if cfg.CacheTTL.Duration > 0 {
-			if cached, ok := s.cache.get(cacheKey); ok {
-				return cached, nil
+		if s.cache != nil && cfg.CacheTTL.Duration > 0 {
+			cached, ok, err := s.cache.Get(ctx, cacheKey)
+			if err != nil {
+				log.Printf("pricing cache get failed: %v", err)
+			} else if ok {
+				var cachedPricing map[string]cost.ResourcePricing
+				if err := json.Unmarshal([]byte(cached), &cachedPricing); err != nil {
+					log.Printf("pricing cache decode failed: %v", err)
+				} else {
+					return cachedPricing, nil
+				}
 			}
 		}
 
@@ -79,8 +90,13 @@ func (s *Service) Resolve(ctx context.Context, cfg domain.Config) (map[string]co
 		}
 
 		mapped := mergeDefaults(cfg.Defaults, prices, cfg.Regions)
-		if cfg.CacheTTL.Duration > 0 {
-			s.cache.set(cacheKey, mapped, cfg.CacheTTL.Duration)
+		if s.cache != nil && cfg.CacheTTL.Duration > 0 {
+			encoded, err := json.Marshal(mapped)
+			if err != nil {
+				log.Printf("pricing cache encode failed: %v", err)
+			} else if err := s.cache.Set(ctx, cacheKey, string(encoded), cfg.CacheTTL.Duration); err != nil {
+				log.Printf("pricing cache set failed: %v", err)
+			}
 		}
 		return mapped, nil
 	}
@@ -116,6 +132,18 @@ func mergeDefaults(defaults domain.ResourcePricing, prices []domain.InstancePric
 			Network:      defaults.Network,
 			TotalPerHour: defaults.TotalPerHour,
 			GPUPricing:   defaults.GPUPricing,
+		}
+	}
+	if _, ok := result["default"]; !ok {
+		fallback := applyRegionMultiplier(defaults, "", regionMultipliers)
+		fallback = splitTotalIfNeeded(fallback, defaults)
+		result["default"] = cost.ResourcePricing{
+			CPU:          fallback.CPU,
+			Memory:       fallback.Memory,
+			Storage:      fallback.Storage,
+			Network:      fallback.Network,
+			TotalPerHour: fallback.TotalPerHour,
+			GPUPricing:   fallback.GPUPricing,
 		}
 	}
 	return result
@@ -216,34 +244,4 @@ func splitTotalIfNeeded(pricing domain.ResourcePricing, defaults domain.Resource
 	pricing.Memory = pricing.TotalPerHour * (defaults.Memory / denom)
 	pricing.Storage = pricing.TotalPerHour * (defaults.Storage / denom)
 	return pricing
-}
-
-// cache is a simple in-memory TTL cache.
-type cache struct {
-	items map[string]cacheEntry
-}
-
-type cacheEntry struct {
-	value     map[string]cost.ResourcePricing
-	expiresAt time.Time
-}
-
-func newCache() *cache {
-	return &cache{items: map[string]cacheEntry{}}
-}
-
-func (c *cache) get(key string) (map[string]cost.ResourcePricing, bool) {
-	entry, ok := c.items[key]
-	if !ok {
-		return nil, false
-	}
-	if time.Now().After(entry.expiresAt) {
-		delete(c.items, key)
-		return nil, false
-	}
-	return entry.value, true
-}
-
-func (c *cache) set(key string, value map[string]cost.ResourcePricing, ttl time.Duration) {
-	c.items[key] = cacheEntry{value: value, expiresAt: time.Now().Add(ttl)}
 }

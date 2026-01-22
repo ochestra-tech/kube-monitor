@@ -26,6 +26,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	metricsv "k8s.io/metrics/pkg/client/clientset/versioned"
 
+	cacheadapter "github.com/ochestra-tech/k8s-monitor/internal/adapters/cache"
 	awsp "github.com/ochestra-tech/k8s-monitor/internal/adapters/pricing/aws"
 	azurep "github.com/ochestra-tech/k8s-monitor/internal/adapters/pricing/azure"
 	gcpp "github.com/ochestra-tech/k8s-monitor/internal/adapters/pricing/gcp"
@@ -36,6 +37,7 @@ import (
 	domainpricing "github.com/ochestra-tech/k8s-monitor/internal/domain/pricing"
 	portspricing "github.com/ochestra-tech/k8s-monitor/internal/ports/pricing"
 	"github.com/ochestra-tech/k8s-monitor/pkg/cost"
+	"github.com/ochestra-tech/k8s-monitor/pkg/optimizer"
 	"github.com/ochestra-tech/k8s-monitor/pkg/reports"
 )
 
@@ -112,6 +114,8 @@ type Config struct {
 	MetricsReadHeaderTimeout time.Duration
 	RequestTimeout           time.Duration
 	ShutdownTimeout          time.Duration
+	KubeQPS                  float32
+	KubeBurst                int
 	EnableDetailedMetrics    bool
 	MetricsTopNamespaces     int
 	DetailedMetricsInterval  time.Duration
@@ -127,7 +131,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	clientset, metricsClient := initKubernetesClients(config.KubeConfigPath)
+	clientset, metricsClient := initKubernetesClients(config.KubeConfigPath, config.KubeQPS, config.KubeBurst)
 	pricing, err := resolvePricing(ctx, config.PricingConfigPath, config.PricingDebug, config.PricingDebugLogPath)
 	if err != nil {
 		log.Fatalf("Failed to resolve pricing: %v", err)
@@ -215,10 +219,13 @@ func parseFlags() *Config {
 	flag.StringVar((*string)(&config.ReportFormat), "format", string(reports.FormatText), "Report format (text, json, html)")
 	flag.StringVar(&config.ReportPath, "output", "", "Output file path (empty for stdout)")
 	flag.DurationVar(&config.CheckInterval, "interval", 60*time.Second, "Check interval for continuous monitoring")
-	flag.IntVar(&config.MetricsPort, "metrics-port", 8084, "Prometheus metrics port")
+	flag.IntVar(&config.MetricsPort, "metrics-port", 8085, "Prometheus metrics port")
 	flag.DurationVar(&config.MetricsReadHeaderTimeout, "metrics-read-header-timeout", 5*time.Second, "Read header timeout for metrics server")
 	flag.DurationVar(&config.RequestTimeout, "request-timeout", 90*time.Second, "Timeout for a single report cycle")
 	flag.DurationVar(&config.ShutdownTimeout, "shutdown-timeout", 10*time.Second, "Graceful shutdown timeout")
+	kubeQPS := 20.0
+	flag.Float64Var(&kubeQPS, "kube-qps", 20, "Kubernetes client QPS (rate limiter)")
+	flag.IntVar(&config.KubeBurst, "kube-burst", 40, "Kubernetes client burst (rate limiter)")
 	flag.BoolVar(&config.EnableDetailedMetrics, "enable-detailed-metrics", false, "Enable namespace/phase metrics (top namespaces only)")
 	flag.IntVar(&config.MetricsTopNamespaces, "metrics-top-namespaces", 10, "Max namespaces to export metrics for (others aggregated)")
 	flag.DurationVar(&config.DetailedMetricsInterval, "detailed-metrics-interval", 5*time.Minute, "Interval for detailed metrics collection")
@@ -228,6 +235,7 @@ func parseFlags() *Config {
 	flag.StringVar(&config.ReportType, "type", "combined", "Report type (health, cost, combined)")
 
 	flag.Parse()
+	config.KubeQPS = float32(kubeQPS)
 	return config
 }
 
@@ -243,6 +251,7 @@ func startMetricsServer(
 	mux.Handle("/api/health", withCORS(reportHandler("health", clientset, metricsClient, pricing, config.RequestTimeout)))
 	mux.Handle("/api/cost", withCORS(reportHandler("cost", clientset, metricsClient, pricing, config.RequestTimeout)))
 	mux.Handle("/api/combined", withCORS(reportHandler("combined", clientset, metricsClient, pricing, config.RequestTimeout)))
+	mux.Handle("/api/optimizer", withCORS(optimizerHandler(clientset, metricsClient, pricing, config.RequestTimeout)))
 
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", config.MetricsPort),
@@ -258,6 +267,106 @@ func startMetricsServer(
 	}()
 
 	return server
+}
+
+func optimizerHandler(
+	clientset *kubernetes.Clientset,
+	metricsClient *metricsv.Clientset,
+	pricing map[string]cost.ResourcePricing,
+	timeout time.Duration,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+
+		q := r.URL.Query()
+		opts := optimizer.Options{
+			Namespace: q.Get("namespace"),
+			Node:      q.Get("node"),
+			Pod:       q.Get("pod"),
+			View:      optimizer.ReportView(q.Get("view")),
+		}
+
+		// Toggles (default true)
+		opts.IncludeIdle = q.Get("includeIdle") != "false"
+		opts.IncludeOverprovisioned = q.Get("includeOverprovisioned") != "false"
+		opts.IncludeCleanup = q.Get("includeCleanup") != "false"
+		opts.DryRunCleanup = q.Get("dryRunCleanup") != "false"
+		opts.IncludeNetwork = q.Get("includeNetwork") != "false"
+		opts.IncludeStorage = q.Get("includeStorage") != "false"
+
+		// Thresholds
+		if v := q.Get("idleCpuPercent"); v != "" {
+			if parsed, err := parseFloat(v); err == nil {
+				opts.IdleCPUPercent = parsed
+			}
+		}
+		if v := q.Get("idleMemoryPercent"); v != "" {
+			if parsed, err := parseFloat(v); err == nil {
+				opts.IdleMemoryPercent = parsed
+			}
+		}
+		if v := q.Get("overprovisionedFactor"); v != "" {
+			if parsed, err := parseFloat(v); err == nil {
+				opts.OverprovisionedFactor = parsed
+			}
+		}
+		if v := q.Get("headroomFactor"); v != "" {
+			if parsed, err := parseFloat(v); err == nil {
+				opts.HeadroomFactor = parsed
+			}
+		}
+		if v := q.Get("networkIdleBytesPerSec"); v != "" {
+			if parsed, err := parseFloat(v); err == nil {
+				opts.NetworkIdleBytesPerSec = parsed
+			}
+		}
+		if v := q.Get("storageLowUtilPercent"); v != "" {
+			if parsed, err := parseFloat(v); err == nil {
+				opts.StorageLowUtilPercent = parsed
+			}
+		}
+
+		opt := optimizer.NewResourceOptimizerWithPrometheus(clientset, metricsClient, os.Getenv("PROMETHEUS_URL"))
+		report, err := opt.GenerateOptimizationReport(ctx, pricing, opts)
+		if err != nil {
+			status := http.StatusInternalServerError
+			payload := map[string]string{
+				"error":   "failed to generate optimizer report",
+				"details": err.Error(),
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				status = http.StatusGatewayTimeout
+				payload["suggestion"] = "Increase --request-timeout or filter by namespace/node to reduce the amount of data scanned."
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(payload)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(report); err != nil {
+			log.Printf("Failed to write optimizer report response: %v", err)
+		}
+	}
+}
+
+func parseFloat(s string) (float64, error) {
+	// Keep dependencies minimal; use fmt for parsing.
+	var v float64
+	_, err := fmt.Sscanf(s, "%f", &v)
+	return v, err
 }
 
 func withCORS(next http.Handler) http.Handler {
@@ -334,7 +443,7 @@ func runWithTimeout(parentCtx context.Context, timeout time.Duration, run func(c
 	return run(ctx)
 }
 
-func initKubernetesClients(kubeConfigPath string) (*kubernetes.Clientset, *metricsv.Clientset) {
+func initKubernetesClients(kubeConfigPath string, qps float32, burst int) (*kubernetes.Clientset, *metricsv.Clientset) {
 	var config *rest.Config
 	var err error
 
@@ -344,6 +453,13 @@ func initKubernetesClients(kubeConfigPath string) (*kubernetes.Clientset, *metri
 		if err != nil {
 			log.Fatalf("Failed to create Kubernetes config: %v", err)
 		}
+	}
+
+	if qps > 0 {
+		config.QPS = qps
+	}
+	if burst > 0 {
+		config.Burst = burst
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
@@ -400,7 +516,8 @@ func resolvePricing(ctx context.Context, configPath string, debug bool, debugLog
 		providers = append(providers, awsProvider)
 	}
 
-	service := apppricing.NewService(providers)
+	cacheStore := cacheadapter.NewFromEnv()
+	service := apppricing.NewService(providers, cacheStore)
 	return service.Resolve(ctx, configData)
 }
 
