@@ -37,6 +37,7 @@ import (
 	domainpricing "github.com/ochestra-tech/k8s-monitor/internal/domain/pricing"
 	portspricing "github.com/ochestra-tech/k8s-monitor/internal/ports/pricing"
 	"github.com/ochestra-tech/k8s-monitor/pkg/cost"
+	"github.com/ochestra-tech/k8s-monitor/pkg/optimizer"
 	"github.com/ochestra-tech/k8s-monitor/pkg/reports"
 )
 
@@ -218,7 +219,7 @@ func parseFlags() *Config {
 	flag.StringVar((*string)(&config.ReportFormat), "format", string(reports.FormatText), "Report format (text, json, html)")
 	flag.StringVar(&config.ReportPath, "output", "", "Output file path (empty for stdout)")
 	flag.DurationVar(&config.CheckInterval, "interval", 60*time.Second, "Check interval for continuous monitoring")
-	flag.IntVar(&config.MetricsPort, "metrics-port", 8084, "Prometheus metrics port")
+	flag.IntVar(&config.MetricsPort, "metrics-port", 8085, "Prometheus metrics port")
 	flag.DurationVar(&config.MetricsReadHeaderTimeout, "metrics-read-header-timeout", 5*time.Second, "Read header timeout for metrics server")
 	flag.DurationVar(&config.RequestTimeout, "request-timeout", 90*time.Second, "Timeout for a single report cycle")
 	flag.DurationVar(&config.ShutdownTimeout, "shutdown-timeout", 10*time.Second, "Graceful shutdown timeout")
@@ -250,6 +251,7 @@ func startMetricsServer(
 	mux.Handle("/api/health", withCORS(reportHandler("health", clientset, metricsClient, pricing, config.RequestTimeout)))
 	mux.Handle("/api/cost", withCORS(reportHandler("cost", clientset, metricsClient, pricing, config.RequestTimeout)))
 	mux.Handle("/api/combined", withCORS(reportHandler("combined", clientset, metricsClient, pricing, config.RequestTimeout)))
+	mux.Handle("/api/optimizer", withCORS(optimizerHandler(clientset, metricsClient, pricing, config.RequestTimeout)))
 
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", config.MetricsPort),
@@ -265,6 +267,106 @@ func startMetricsServer(
 	}()
 
 	return server
+}
+
+func optimizerHandler(
+	clientset *kubernetes.Clientset,
+	metricsClient *metricsv.Clientset,
+	pricing map[string]cost.ResourcePricing,
+	timeout time.Duration,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+
+		q := r.URL.Query()
+		opts := optimizer.Options{
+			Namespace: q.Get("namespace"),
+			Node:      q.Get("node"),
+			Pod:       q.Get("pod"),
+			View:      optimizer.ReportView(q.Get("view")),
+		}
+
+		// Toggles (default true)
+		opts.IncludeIdle = q.Get("includeIdle") != "false"
+		opts.IncludeOverprovisioned = q.Get("includeOverprovisioned") != "false"
+		opts.IncludeCleanup = q.Get("includeCleanup") != "false"
+		opts.DryRunCleanup = q.Get("dryRunCleanup") != "false"
+		opts.IncludeNetwork = q.Get("includeNetwork") != "false"
+		opts.IncludeStorage = q.Get("includeStorage") != "false"
+
+		// Thresholds
+		if v := q.Get("idleCpuPercent"); v != "" {
+			if parsed, err := parseFloat(v); err == nil {
+				opts.IdleCPUPercent = parsed
+			}
+		}
+		if v := q.Get("idleMemoryPercent"); v != "" {
+			if parsed, err := parseFloat(v); err == nil {
+				opts.IdleMemoryPercent = parsed
+			}
+		}
+		if v := q.Get("overprovisionedFactor"); v != "" {
+			if parsed, err := parseFloat(v); err == nil {
+				opts.OverprovisionedFactor = parsed
+			}
+		}
+		if v := q.Get("headroomFactor"); v != "" {
+			if parsed, err := parseFloat(v); err == nil {
+				opts.HeadroomFactor = parsed
+			}
+		}
+		if v := q.Get("networkIdleBytesPerSec"); v != "" {
+			if parsed, err := parseFloat(v); err == nil {
+				opts.NetworkIdleBytesPerSec = parsed
+			}
+		}
+		if v := q.Get("storageLowUtilPercent"); v != "" {
+			if parsed, err := parseFloat(v); err == nil {
+				opts.StorageLowUtilPercent = parsed
+			}
+		}
+
+		opt := optimizer.NewResourceOptimizerWithPrometheus(clientset, metricsClient, os.Getenv("PROMETHEUS_URL"))
+		report, err := opt.GenerateOptimizationReport(ctx, pricing, opts)
+		if err != nil {
+			status := http.StatusInternalServerError
+			payload := map[string]string{
+				"error":   "failed to generate optimizer report",
+				"details": err.Error(),
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				status = http.StatusGatewayTimeout
+				payload["suggestion"] = "Increase --request-timeout or filter by namespace/node to reduce the amount of data scanned."
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(payload)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(report); err != nil {
+			log.Printf("Failed to write optimizer report response: %v", err)
+		}
+	}
+}
+
+func parseFloat(s string) (float64, error) {
+	// Keep dependencies minimal; use fmt for parsing.
+	var v float64
+	_, err := fmt.Sscanf(s, "%f", &v)
+	return v, err
 }
 
 func withCORS(next http.Handler) http.Handler {

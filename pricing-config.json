@@ -1,0 +1,45 @@
+{
+  "defaults": {
+    "CPU": 0.03,
+    "Memory": 0.004,
+    "Storage": 0.00012,
+    "Network": 0.08,
+    "TotalPerHour": 0,
+    "GPUPricing": {
+      "nvidia-tesla-k80": 0.6,
+      "nvidia-tesla-v100": 1.2
+    }
+  },
+  "instanceTypes": {
+    "c5.large": {
+      "CPU": 0.035,
+      "Memory": 0.0035,
+      "Storage": 0.00018,
+      "Network": 0.095,
+      "TotalPerHour": 0,
+      "GPUPricing": null
+    },
+    "m5.large": {
+      "CPU": 0.032,
+      "Memory": 0.0045,
+      "Storage": 0.00015,
+      "Network": 0.09,
+      "TotalPerHour": 0,
+      "GPUPricing": null
+    },
+    "r5.large": {
+      "CPU": 0.03,
+      "Memory": 0.0055,
+      "Storage": 0.00012,
+      "Network": 0.085,
+      "TotalPerHour": 0,
+      "GPUPricing": null
+    }
+  },
+  "regionMultipliers": {
+    "ap-southeast-1": 1.15,
+    "eu-west-1": 1.1,
+    "us-east-1": 1,
+    "us-west-2": 1.05
+  }
+}

@@ -134,6 +134,18 @@ func mergeDefaults(defaults domain.ResourcePricing, prices []domain.InstancePric
 			GPUPricing:   defaults.GPUPricing,
 		}
 	}
+	if _, ok := result["default"]; !ok {
+		fallback := applyRegionMultiplier(defaults, "", regionMultipliers)
+		fallback = splitTotalIfNeeded(fallback, defaults)
+		result["default"] = cost.ResourcePricing{
+			CPU:          fallback.CPU,
+			Memory:       fallback.Memory,
+			Storage:      fallback.Storage,
+			Network:      fallback.Network,
+			TotalPerHour: fallback.TotalPerHour,
+			GPUPricing:   fallback.GPUPricing,
+		}
+	}
 	return result
 }
 

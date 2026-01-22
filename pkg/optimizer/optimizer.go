@@ -1,39 +1,114 @@
 package optimizer
 
 import (
-	"context"
-	"fmt"
-	"log"
+	"strings"
 	"time"
 
-	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/metrics/pkg/client/clientset/versioned"
 )
 
-type OptimizationReport struct {
-	PotentialSavings float64
-	Recommendations  []Recommendation
+type ReportView string
+
+const (
+	ViewFull    ReportView = "full"
+	ViewSummary ReportView = "summary"
+	ViewDetails ReportView = "details"
+)
+
+type Options struct {
+	// Filters
+	Namespace string
+	Node      string
+	Pod       string
+
+	// Toggles
+	IncludeIdle            bool
+	IncludeOverprovisioned bool
+	IncludeCleanup         bool
+	DryRunCleanup          bool
+	IncludeNetwork         bool
+	IncludeStorage         bool
+
+	// Thresholds
+	// Idle thresholds are interpreted as % of requests (0-100).
+	IdleCPUPercent    float64
+	IdleMemoryPercent float64
+
+	// OverprovisionedFactor flags resources where request > usage * factor.
+	OverprovisionedFactor float64
+
+	// HeadroomFactor suggests new request ~= usage * headroomFactor.
+	HeadroomFactor float64
+
+	// NetworkIdleBytesPerSec flags pods with total rx+tx <= threshold.
+	NetworkIdleBytesPerSec float64
+
+	// StorageLowUtilPercent flags PVCs with used/capacity <= threshold (0-100).
+	StorageLowUtilPercent float64
+
+	View ReportView
 }
 
-type Recommendation struct {
-	Type            string
-	Description     string
-	PotentialSaving float64
+type OptimizationReport struct {
+	GeneratedAt time.Time               `json:"generated_at"`
+	Options     Options                 `json:"options"`
+	Summary     Summary                 `json:"summary"`
+	Details     []Detail                `json:"details,omitempty"`
+	Cleanup     []CleanupRecommendation `json:"cleanup,omitempty"`
+}
+
+type Summary struct {
+	PotentialMonthlySavings float64 `json:"potential_monthly_savings"`
+	IdleResources           Counts  `json:"idle_resources"`
+	Overprovisioned         Counts  `json:"overprovisioned"`
+	WastedCPUCoreHours      float64 `json:"wasted_cpu_core_hours"`
+	WastedMemoryGBHours     float64 `json:"wasted_memory_gb_hours"`
+}
+
+type Counts struct {
+	Nodes      int `json:"nodes"`
+	Namespaces int `json:"namespaces"`
+	Pods       int `json:"pods"`
+	Containers int `json:"containers"`
+}
+
+type Detail struct {
+	Category  string `json:"category"` // idle | overprovisioned
+	Level     string `json:"level"`    // node | namespace | pod | container | pvc
+	Node      string `json:"node,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Pod       string `json:"pod,omitempty"`
+	Container string `json:"container,omitempty"`
+	PVC       string `json:"pvc,omitempty"`
+
+	CPUUsageMillicores   int64 `json:"cpu_usage_millicores,omitempty"`
+	CPURequestMillicores int64 `json:"cpu_request_millicores,omitempty"`
+	CPULimitMillicores   int64 `json:"cpu_limit_millicores,omitempty"`
+	MemoryUsageBytes     int64 `json:"memory_usage_bytes,omitempty"`
+	MemoryRequestBytes   int64 `json:"memory_request_bytes,omitempty"`
+	MemoryLimitBytes     int64 `json:"memory_limit_bytes,omitempty"`
+
+	WastedCPUMillicores    int64   `json:"wasted_cpu_millicores,omitempty"`
+	WastedMemoryBytes      int64   `json:"wasted_memory_bytes,omitempty"`
+	PotentialMonthlySaving float64 `json:"potential_monthly_saving,omitempty"`
+
+	NetworkReceiveBytesPerSec  float64 `json:"network_receive_bytes_per_sec,omitempty"`
+	NetworkTransmitBytesPerSec float64 `json:"network_transmit_bytes_per_sec,omitempty"`
+
+	PVCUsedBytes          int64   `json:"pvc_used_bytes,omitempty"`
+	PVCCapacityBytes      int64   `json:"pvc_capacity_bytes,omitempty"`
+	PVCUtilizationPercent float64 `json:"pvc_utilization_percent,omitempty"`
+	PVCWastedBytes        int64   `json:"pvc_wasted_bytes,omitempty"`
+
+	Recommendation string `json:"recommendation,omitempty"`
 }
 
 type ResourceOptimizer struct {
 	clientset     *kubernetes.Clientset
 	metricsClient *versioned.Clientset
-}
-
-func (o *ResourceOptimizer) GenerateOptimizationReport(ctx context.Context) (*OptimizationReport, error) {
-	return &OptimizationReport{
-		PotentialSavings: 0.0,
-		Recommendations:  []Recommendation{},
-	}, nil
+	promClient    *PrometheusClient
 }
 
 func NewResourceOptimizer(clientset *kubernetes.Clientset, metricsClient *versioned.Clientset) *ResourceOptimizer {
@@ -43,148 +118,37 @@ func NewResourceOptimizer(clientset *kubernetes.Clientset, metricsClient *versio
 	}
 }
 
-func initKubernetesClients() (*kubernetes.Clientset, *versioned.Clientset) {
+func NewResourceOptimizerWithPrometheus(clientset *kubernetes.Clientset, metricsClient *versioned.Clientset, prometheusURL string) *ResourceOptimizer {
+	opt := NewResourceOptimizer(clientset, metricsClient)
+	if strings.TrimSpace(prometheusURL) != "" {
+		opt.promClient = NewPrometheusClient(prometheusURL)
+	}
+	return opt
+}
+
+func InitInClusterClients() (*kubernetes.Clientset, *versioned.Clientset, error) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		log.Fatal(err)
+		return nil, nil, err
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		log.Fatal(err)
+		return nil, nil, err
 	}
 
 	metricsClient, err := versioned.NewForConfig(config)
 	if err != nil {
-		log.Fatal(err)
+		return nil, nil, err
 	}
 
-	return clientset, metricsClient
+	return clientset, metricsClient, nil
 }
 
 type CleanupRecommendation struct {
-	ResourceType string
-	Namespace    string
-	Name         string
-	Reason       string
-	Age          time.Duration
-}
-
-func CleanupUnusedResources(ctx context.Context, clientset *kubernetes.Clientset, dryRun bool) ([]CleanupRecommendation, error) {
-	recommendations := make([]CleanupRecommendation, 0)
-
-	// Find unused ConfigMaps
-	configMaps, err := clientset.CoreV1().ConfigMaps("").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list configmaps: %w", err)
-	}
-
-	pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list pods: %w", err)
-	}
-
-	// Create a map of configmaps in use
-	configMapsInUse := make(map[string]bool)
-	for _, pod := range pods.Items {
-		for _, volume := range pod.Spec.Volumes {
-			if volume.ConfigMap != nil {
-				key := fmt.Sprintf("%s/%s", pod.Namespace, volume.ConfigMap.Name)
-				configMapsInUse[key] = true
-			}
-		}
-
-		for _, container := range pod.Spec.Containers {
-			for _, env := range container.Env {
-				if env.ValueFrom != nil && env.ValueFrom.ConfigMapKeyRef != nil {
-					key := fmt.Sprintf("%s/%s", pod.Namespace, env.ValueFrom.ConfigMapKeyRef.Name)
-					configMapsInUse[key] = true
-				}
-			}
-		}
-	}
-
-	// Find unused configmaps
-	for _, cm := range configMaps.Items {
-		key := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
-		if !configMapsInUse[key] {
-			rec := CleanupRecommendation{
-				ResourceType: "ConfigMap",
-				Namespace:    cm.Namespace,
-				Name:         cm.Name,
-				Reason:       "Not referenced by any pod",
-				Age:          time.Since(cm.CreationTimestamp.Time),
-			}
-			recommendations = append(recommendations, rec)
-
-			if !dryRun {
-				// Delete unused configmap
-				err := clientset.CoreV1().ConfigMaps(cm.Namespace).Delete(ctx, cm.Name, metav1.DeleteOptions{})
-				if err != nil {
-					log.Printf("Failed to delete configmap %s/%s: %v", cm.Namespace, cm.Name, err)
-				} else {
-					log.Printf("Deleted unused configmap %s/%s", cm.Namespace, cm.Name)
-				}
-			}
-		}
-	}
-
-	// Find failed pods older than 7 days
-	for _, pod := range pods.Items {
-		if pod.Status.Phase == v1.PodFailed || pod.Status.Phase == v1.PodSucceeded {
-			age := time.Since(pod.CreationTimestamp.Time)
-			if age > 7*24*time.Hour {
-				rec := CleanupRecommendation{
-					ResourceType: "Pod",
-					Namespace:    pod.Namespace,
-					Name:         pod.Name,
-					Reason:       fmt.Sprintf("Failed/Completed pod older than 7 days (status: %s)", pod.Status.Phase),
-					Age:          age,
-				}
-				recommendations = append(recommendations, rec)
-
-				if !dryRun {
-					// Delete old failed/succeeded pod
-					err := clientset.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-					if err != nil {
-						log.Printf("Failed to delete pod %s/%s: %v", pod.Namespace, pod.Name, err)
-					} else {
-						log.Printf("Deleted old pod %s/%s", pod.Namespace, pod.Name)
-					}
-				}
-			}
-		}
-	}
-	return []CleanupRecommendation{}, nil
-}
-
-func main() {
-	clientset, metricsClient := initKubernetesClients()
-
-	// Run resource optimization analysis
-	optimizer := NewResourceOptimizer(clientset, metricsClient)
-	report, err := optimizer.GenerateOptimizationReport(context.Background())
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Printf("Potential Monthly Savings: $%.2f\n", report.PotentialSavings)
-	fmt.Printf("Optimization Recommendations: %d\n", len(report.Recommendations))
-
-	for _, rec := range report.Recommendations {
-		fmt.Printf("- %s: %s (Save $%.2f/month)\n",
-			rec.Type, rec.Description, rec.PotentialSaving)
-	}
-
-	// Run cleanup with dry-run
-	cleanupRecs, err := CleanupUnusedResources(context.Background(), clientset, true)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Printf("\nCleanup Recommendations: %d\n", len(cleanupRecs))
-	for _, rec := range cleanupRecs {
-		fmt.Printf("- Delete %s %s/%s: %s\n",
-			rec.ResourceType, rec.Namespace, rec.Name, rec.Reason)
-	}
+	ResourceType string `json:"resource_type"`
+	Namespace    string `json:"namespace"`
+	Name         string `json:"name"`
+	Reason       string `json:"reason"`
+	AgeSeconds   int64  `json:"age,omitempty"`
 }
