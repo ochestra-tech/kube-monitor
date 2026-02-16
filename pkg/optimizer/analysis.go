@@ -398,15 +398,31 @@ func (o *ResourceOptimizer) GenerateOptimizationReport(
 
 	// Prometheus-backed signals (network + storage).
 	if o.promClient != nil {
+		report.Telemetry.PrometheusConfigured = true
+		if _, err := o.promClient.QueryVector(ctx, "up"); err != nil {
+			report.Telemetry.PrometheusReachable = false
+			report.Telemetry.PrometheusError = err.Error()
+		} else {
+			report.Telemetry.PrometheusReachable = true
+		}
+
+		if !report.Telemetry.PrometheusReachable {
+			// Prometheus is not reachable; skip network/storage to avoid failing the whole report.
+			goto PROM_DONE
+		}
+
 		if opts.IncludeNetwork {
 			rxSamples, err := o.promClient.QueryVector(ctx, `sum by (namespace,pod) (rate(container_network_receive_bytes_total{namespace!="",pod!=""}[5m]))`)
 			if err != nil {
-				return nil, fmt.Errorf("prometheus network rx query failed: %w", err)
+				report.Telemetry.PrometheusError = fmt.Sprintf("network rx query failed: %v", err)
+				goto PROM_DONE
 			}
 			txSamples, err := o.promClient.QueryVector(ctx, `sum by (namespace,pod) (rate(container_network_transmit_bytes_total{namespace!="",pod!=""}[5m]))`)
 			if err != nil {
-				return nil, fmt.Errorf("prometheus network tx query failed: %w", err)
+				report.Telemetry.PrometheusError = fmt.Sprintf("network tx query failed: %v", err)
+				goto PROM_DONE
 			}
+			report.Telemetry.NetworkMetricsAvailable = len(rxSamples) > 0 || len(txSamples) > 0
 
 			rx := make(map[string]float64, len(rxSamples))
 			for _, s := range rxSamples {
@@ -463,12 +479,15 @@ func (o *ResourceOptimizer) GenerateOptimizationReport(
 		if opts.IncludeStorage {
 			usedSamples, err := o.promClient.QueryVector(ctx, `sum by (namespace,persistentvolumeclaim) (kubelet_volume_stats_used_bytes{namespace!="",persistentvolumeclaim!=""})`)
 			if err != nil {
-				return nil, fmt.Errorf("prometheus pvc used query failed: %w", err)
+				report.Telemetry.PrometheusError = fmt.Sprintf("pvc used query failed: %v", err)
+				goto PROM_DONE
 			}
 			capSamples, err := o.promClient.QueryVector(ctx, `sum by (namespace,persistentvolumeclaim) (kubelet_volume_stats_capacity_bytes{namespace!="",persistentvolumeclaim!=""})`)
 			if err != nil {
-				return nil, fmt.Errorf("prometheus pvc capacity query failed: %w", err)
+				report.Telemetry.PrometheusError = fmt.Sprintf("pvc capacity query failed: %v", err)
+				goto PROM_DONE
 			}
+			report.Telemetry.StorageMetricsAvailable = len(usedSamples) > 0 || len(capSamples) > 0
 
 			used := make(map[string]float64, len(usedSamples))
 			for _, s := range usedSamples {
@@ -537,6 +556,8 @@ func (o *ResourceOptimizer) GenerateOptimizationReport(
 				}
 			}
 		}
+
+	PROM_DONE:
 	}
 
 	report.Summary.IdleResources = Counts{
