@@ -1,5 +1,7 @@
 # A Simple Easy to Use Kubernetes Health and Cost Tracking Tool
 
+[![CI](https://github.com/ochestra-tech/k8s-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/ochestra-tech/k8s-monitor/actions/workflows/ci.yml)
+
 A comprehensive Go-based tool for monitoring Kubernetes cluster health and managing costs. This tool provides real-time health assessments, cost tracking, optimization recommendations, and detailed reporting for Kubernetes environments.
 
 See the detailed user guide: [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
@@ -55,6 +57,20 @@ go mod tidy
 # Build the application
 go build -o k8s-monitor ./cmd
 ```
+
+### Container Images
+
+Container images are published to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/ochestra-tech/k8s-monitor:latest
+```
+
+Available tags:
+
+- `main` branch pushes publish branch and commit-SHA tags
+- `v1.2.3` git tags publish `1.2.3`, `1.2`, and `latest`
+- Pull requests build the container image for validation but do not publish it
 
 ### Dependencies
 
