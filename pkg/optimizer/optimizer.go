@@ -55,8 +55,17 @@ type OptimizationReport struct {
 	GeneratedAt time.Time               `json:"generated_at"`
 	Options     Options                 `json:"options"`
 	Summary     Summary                 `json:"summary"`
+	Telemetry   TelemetryStatus         `json:"telemetry"`
 	Details     []Detail                `json:"details,omitempty"`
 	Cleanup     []CleanupRecommendation `json:"cleanup,omitempty"`
+}
+
+type TelemetryStatus struct {
+	PrometheusConfigured    bool   `json:"prometheus_configured"`
+	PrometheusReachable     bool   `json:"prometheus_reachable"`
+	PrometheusError         string `json:"prometheus_error,omitempty"`
+	NetworkMetricsAvailable bool   `json:"network_metrics_available"`
+	StorageMetricsAvailable bool   `json:"storage_metrics_available"`
 }
 
 type Summary struct {

@@ -36,6 +36,7 @@ func (p *Provider) Name() string {
 }
 
 func (p *Provider) Fetch(ctx context.Context, req ports.Request) ([]domain.InstancePricing, error) {
+
 	if req.Region == "" {
 		return nil, fmt.Errorf("aws region is required")
 	}
@@ -69,6 +70,7 @@ func (p *Provider) Fetch(ctx context.Context, req ports.Request) ([]domain.Insta
 		}
 
 		out, err := p.client.GetProducts(ctx, input)
+
 		if err != nil {
 			return nil, err
 		}
