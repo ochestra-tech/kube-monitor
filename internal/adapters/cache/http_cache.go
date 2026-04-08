@@ -15,7 +15,7 @@ import (
 	ports "github.com/ochestra-tech/k8s-monitor/internal/ports/cache"
 )
 
-const defaultCacheServiceURL = "http://localhost:8083"
+const defaultCacheServiceURL = "https://cacheapi-dev.kubeopera.io/"
 
 const cacheRequestTimeout = 5 * time.Second
 
@@ -36,7 +36,7 @@ type cacheGetResponse struct {
 }
 
 func NewFromEnv() ports.Store {
-	cacheURL := strings.TrimSpace(os.Getenv("K8S_MONITOR_CACHE_URL"))
+	cacheURL := strings.TrimSpace(os.Getenv("CACHE_URL"))
 	if cacheURL == "" {
 		cacheURL = defaultCacheServiceURL
 	}
