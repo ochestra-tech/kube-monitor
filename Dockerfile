@@ -14,4 +14,4 @@ WORKDIR /app/
 COPY --from=builder /app/k8s-monitor ./k8s-monitor
 COPY configs/pricing-config.json ./configs/pricing-config.json
 
-CMD ["./k8s-monitor"]
+ENTRYPOINT ["./k8s-monitor"]
