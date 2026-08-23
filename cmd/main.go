@@ -26,17 +26,23 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	metricsv "k8s.io/metrics/pkg/client/clientset/versioned"
 
+	anomalypub "github.com/ochestra-tech/k8s-monitor/internal/adapters/anomaly"
 	cacheadapter "github.com/ochestra-tech/k8s-monitor/internal/adapters/cache"
 	awsp "github.com/ochestra-tech/k8s-monitor/internal/adapters/pricing/aws"
 	azurep "github.com/ochestra-tech/k8s-monitor/internal/adapters/pricing/azure"
 	gcpp "github.com/ochestra-tech/k8s-monitor/internal/adapters/pricing/gcp"
 	staticp "github.com/ochestra-tech/k8s-monitor/internal/adapters/pricing/static"
 	reportingadapter "github.com/ochestra-tech/k8s-monitor/internal/adapters/reporting"
+	storeimpl "github.com/ochestra-tech/k8s-monitor/internal/adapters/store/inmemory"
+	pgstore "github.com/ochestra-tech/k8s-monitor/internal/adapters/store/postgres"
 	apppricing "github.com/ochestra-tech/k8s-monitor/internal/app/pricing"
 	appreporting "github.com/ochestra-tech/k8s-monitor/internal/app/reporting"
 	domainpricing "github.com/ochestra-tech/k8s-monitor/internal/domain/pricing"
 	portspricing "github.com/ochestra-tech/k8s-monitor/internal/ports/pricing"
+	storeport "github.com/ochestra-tech/k8s-monitor/internal/ports/store"
+	"github.com/ochestra-tech/k8s-monitor/pkg/anomaly"
 	"github.com/ochestra-tech/k8s-monitor/pkg/cost"
+	"github.com/ochestra-tech/k8s-monitor/pkg/health"
 	"github.com/ochestra-tech/k8s-monitor/pkg/optimizer"
 	"github.com/ochestra-tech/k8s-monitor/pkg/reports"
 )
@@ -123,10 +129,27 @@ type Config struct {
 	PricingDebugLogPath      string
 	OneShot                  bool
 	ReportType               string // "health", "cost", "combined"
+	// Anomaly detection / time-series options
+	ClusterID          string
+	AnomalyWindowSize  int
+	AnomalyZThreshold  float64
+	RingBufferCapacity int
+	// Optional Postgres-backed time-series store (opt-in via DATABASE_URL env var).
+	DatabaseURL string
 }
 
 func main() {
 	config := parseFlags()
+	validateConfig(config)
+
+	// Default cluster ID to hostname when not explicitly set.
+	if config.ClusterID == "" {
+		if h, err := os.Hostname(); err == nil {
+			config.ClusterID = h
+		} else {
+			config.ClusterID = "default"
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -137,12 +160,30 @@ func main() {
 		log.Fatalf("Failed to resolve pricing: %v", err)
 	}
 
+	// ── Time-series store + anomaly detection ──────────────────────────────────
+	// Default: in-memory ring buffer. Opt-in to Postgres when DATABASE_URL is set.
+	var tsStore storeport.TimeSeriesStore = storeimpl.NewRingBuffer(config.RingBufferCapacity)
+	if config.DatabaseURL != "" {
+		pg, err := pgstore.New(config.DatabaseURL)
+		if err != nil {
+			log.Printf("[store] postgres unavailable (%v), falling back to ring buffer", err)
+		} else {
+			log.Printf("[store] using postgres time-series store")
+			defer pg.Close()
+			tsStore = pg
+		}
+	}
+	detector := anomaly.NewDetector(config.AnomalyZThreshold, config.AnomalyWindowSize)
+	publisher := anomalypub.NewPublisher() // nil when RABBITMQ_URL is unset
+	defer publisher.Close()
+
 	if config.OneShot {
 		if err := runWithTimeout(ctx, config.RequestTimeout, func(runCtx context.Context) error {
 			return executeReportCycle(runCtx, clientset, metricsClient, pricing, config)
 		}); err != nil {
 			log.Fatalf("Failed to generate report: %v", err)
 		}
+		captureSnapshot(ctx, clientset, metricsClient, config.ClusterID, tsStore, detector, publisher)
 		if config.EnableDetailedMetrics {
 			if err := updateDetailedMetrics(ctx, clientset, config.MetricsTopNamespaces); err != nil {
 				log.Printf("Failed to update detailed metrics: %v", err)
@@ -151,7 +192,7 @@ func main() {
 		return
 	}
 
-	metricsServer := startMetricsServer(config, clientset, metricsClient, pricing)
+	metricsServer := startMetricsServer(config, clientset, metricsClient, pricing, tsStore)
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
 		defer cancel()
@@ -168,6 +209,8 @@ func main() {
 	}); err != nil {
 		log.Printf("Failed to generate initial report: %v", err)
 	}
+	captureSnapshot(ctx, clientset, metricsClient, config.ClusterID, tsStore, detector, publisher)
+
 	if config.EnableDetailedMetrics {
 		if err := updateDetailedMetrics(ctx, clientset, config.MetricsTopNamespaces); err != nil {
 			log.Printf("Failed to update detailed metrics: %v", err)
@@ -197,6 +240,7 @@ func main() {
 			}); err != nil {
 				log.Printf("Failed to generate report: %v", err)
 			}
+			captureSnapshot(ctx, clientset, metricsClient, config.ClusterID, tsStore, detector, publisher)
 		case <-detailedC:
 			if err := updateDetailedMetrics(ctx, clientset, config.MetricsTopNamespaces); err != nil {
 				log.Printf("Failed to update detailed metrics: %v", err)
@@ -233,10 +277,55 @@ func parseFlags() *Config {
 	flag.StringVar(&config.PricingDebugLogPath, "pricing-debug-log", "pricing-debug.log", "File path for pricing debug logs")
 	flag.BoolVar(&config.OneShot, "one-shot", false, "Run once and exit")
 	flag.StringVar(&config.ReportType, "type", "combined", "Report type (health, cost, combined)")
+	flag.StringVar(&config.ClusterID, "cluster-id", "", "Cluster identifier stamped on anomaly events (defaults to hostname)")
+	flag.IntVar(&config.AnomalyWindowSize, "anomaly-window", 60, "Number of recent snapshots used for Z-score anomaly detection")
+	flag.Float64Var(&config.AnomalyZThreshold, "anomaly-z-threshold", 2.5, "Z-score threshold above which a metric is flagged as anomalous")
+	flag.IntVar(&config.RingBufferCapacity, "ring-buffer-capacity", 1000, "Max metric snapshots held in memory per cluster")
+	// Postgres is opt-in — read from env so it doesn't appear in -help output.
+	config.DatabaseURL = os.Getenv("DATABASE_URL")
 
 	flag.Parse()
 	config.KubeQPS = float32(kubeQPS)
 	return config
+}
+
+// validateConfig checks that flag values are within safe bounds and logs fatal
+// errors before any Kubernetes client is created.
+func validateConfig(config *Config) {
+	var errs []string
+
+	if config.MetricsPort < 1 || config.MetricsPort > 65535 {
+		errs = append(errs, fmt.Sprintf("metrics-port %d is not in valid range 1–65535", config.MetricsPort))
+	}
+	if config.CheckInterval < time.Second {
+		errs = append(errs, fmt.Sprintf("interval %v is too short (minimum 1s)", config.CheckInterval))
+	}
+	if config.RequestTimeout < time.Second {
+		errs = append(errs, fmt.Sprintf("request-timeout %v is too short (minimum 1s)", config.RequestTimeout))
+	}
+	if config.ShutdownTimeout < time.Second {
+		errs = append(errs, fmt.Sprintf("shutdown-timeout %v is too short (minimum 1s)", config.ShutdownTimeout))
+	}
+	if config.KubeQPS <= 0 {
+		errs = append(errs, fmt.Sprintf("kube-qps %.1f must be positive", config.KubeQPS))
+	}
+	if config.KubeBurst <= 0 {
+		errs = append(errs, fmt.Sprintf("kube-burst %d must be positive", config.KubeBurst))
+	}
+	if config.MetricsTopNamespaces < 1 {
+		errs = append(errs, fmt.Sprintf("metrics-top-namespaces %d must be at least 1", config.MetricsTopNamespaces))
+	}
+	validTypes := map[string]bool{"health": true, "cost": true, "combined": true}
+	if !validTypes[config.ReportType] {
+		errs = append(errs, fmt.Sprintf("type %q is not valid; choose health, cost, or combined", config.ReportType))
+	}
+
+	if len(errs) > 0 {
+		for _, e := range errs {
+			log.Printf("config error: %s", e)
+		}
+		log.Fatalf("invalid configuration; exiting")
+	}
 }
 
 func startMetricsServer(
@@ -244,6 +333,7 @@ func startMetricsServer(
 	clientset *kubernetes.Clientset,
 	metricsClient *metricsv.Clientset,
 	pricing map[string]cost.ResourcePricing,
+	tsStore storeport.TimeSeriesStore,
 ) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
@@ -252,6 +342,8 @@ func startMetricsServer(
 	mux.Handle("/api/cost", withCORS(reportHandler("cost", clientset, metricsClient, pricing, config.RequestTimeout)))
 	mux.Handle("/api/combined", withCORS(reportHandler("combined", clientset, metricsClient, pricing, config.RequestTimeout)))
 	mux.Handle("/api/optimizer", withCORS(optimizerHandler(clientset, metricsClient, pricing, config.RequestTimeout)))
+	mux.Handle("/api/history", withCORS(historyHandler(tsStore, config.ClusterID, config.RequestTimeout)))
+	mux.Handle("/api/anomalies", withCORS(anomaliesHandler(tsStore, config.ClusterID, config.AnomalyWindowSize, config.AnomalyZThreshold, config.RequestTimeout)))
 
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", config.MetricsPort),
@@ -267,6 +359,157 @@ func startMetricsServer(
 	}()
 
 	return server
+}
+
+// captureSnapshot calls the health checker, builds a MetricPoint and appends it
+// to the time-series store, then runs anomaly detection and optionally publishes.
+func captureSnapshot(
+	ctx context.Context,
+	clientset *kubernetes.Clientset,
+	metricsClient *metricsv.Clientset,
+	clusterID string,
+	tsStore storeport.TimeSeriesStore,
+	detector *anomaly.Detector,
+	publisher *anomalypub.Publisher,
+) {
+	snapCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	ch, err := health.GetClusterHealth(snapCtx, clientset, metricsClient)
+	if err != nil {
+		log.Printf("[snapshot] health check failed: %v", err)
+		return
+	}
+
+	pt := storeport.MetricPoint{
+		Timestamp:          ch.Timestamp,
+		ClusterID:          clusterID,
+		HealthScore:        ch.HealthScore,
+		CPUUsagePct:        ch.ResourceUsage.ClusterCPUUsage,
+		MemoryUsagePct:     ch.ResourceUsage.ClusterMemoryUsage,
+		ReadyNodeCount:     ch.NodeStatus.ReadyNodes,
+		TotalNodeCount:     ch.NodeStatus.TotalNodes,
+		TotalPodCount:      ch.PodStatus.TotalPods,
+		FailedPodCount:     ch.PodStatus.FailedPods,
+		CrashLoopCount:     len(ch.PodStatus.CrashLoopingPods),
+		APIServerLatencyMs: ch.ControlPlaneStatus.APIServerLatency,
+	}
+
+	if err := tsStore.Append(ctx, pt); err != nil {
+		log.Printf("[snapshot] store append failed: %v", err)
+		return
+	}
+
+	// Run anomaly detection over the last AnomalyWindowSize+1 points.
+	recent, err := tsStore.Latest(ctx, clusterID, detector.MinWindowSize+1)
+	if err != nil || len(recent) < detector.MinWindowSize {
+		return
+	}
+	events := detector.Detect(recent)
+	if len(events) > 0 {
+		publisher.Publish(ctx, events)
+	}
+}
+
+// historyHandler returns the stored metric snapshots for a cluster.
+// Query params: cluster_id (overrides default), start (RFC3339), end (RFC3339), limit (int).
+func historyHandler(tsStore storeport.TimeSeriesStore, defaultClusterID string, timeout time.Duration) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx := r.Context()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		q := r.URL.Query()
+		clusterID := q.Get("cluster_id")
+		if clusterID == "" {
+			clusterID = defaultClusterID
+		}
+
+		var points []storeport.MetricPoint
+		var err error
+
+		startStr := q.Get("start")
+		endStr := q.Get("end")
+		if startStr != "" && endStr != "" {
+			start, serr := time.Parse(time.RFC3339, startStr)
+			end, eerr := time.Parse(time.RFC3339, endStr)
+			if serr != nil || eerr != nil {
+				http.Error(w, "invalid start/end; use RFC3339 format", http.StatusBadRequest)
+				return
+			}
+			points, err = tsStore.QueryRange(ctx, clusterID, start, end)
+		} else {
+			limit := 100
+			if v := q.Get("limit"); v != "" {
+				if parsed, perr := parseInt(v); perr == nil && parsed > 0 {
+					limit = parsed
+				}
+			}
+			points, err = tsStore.Latest(ctx, clusterID, limit)
+		}
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"cluster_id": clusterID,
+			"count":      len(points),
+			"points":     points,
+		})
+	}
+}
+
+// anomaliesHandler runs the anomaly detector over the stored window and returns current anomalies.
+func anomaliesHandler(tsStore storeport.TimeSeriesStore, defaultClusterID string, windowSize int, zThreshold float64, timeout time.Duration) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx := r.Context()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		q := r.URL.Query()
+		clusterID := q.Get("cluster_id")
+		if clusterID == "" {
+			clusterID = defaultClusterID
+		}
+
+		detector := anomaly.NewDetector(zThreshold, windowSize)
+		points, err := tsStore.Latest(ctx, clusterID, windowSize+1)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		events := detector.Detect(points)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"cluster_id": clusterID,
+			"count":      len(events),
+			"anomalies":  events,
+		})
+	}
+}
+
+func parseInt(s string) (int, error) {
+	var v int
+	_, err := fmt.Sscanf(s, "%d", &v)
+	return v, err
 }
 
 func optimizerHandler(
@@ -369,14 +612,36 @@ func parseFloat(s string) (float64, error) {
 	return v, err
 }
 
+// withCORS enforces an origin allowlist read from the CORS_ALLOWED_ORIGINS
+// environment variable (comma-separated list).  If the variable is empty, no
+// cross-origin requests are allowed.  Only the exact request origin is echoed
+// back — the wildcard "*" is never used.
 func withCORS(next http.Handler) http.Handler {
+	raw := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS"))
+	allowed := make(map[string]struct{})
+	for _, o := range strings.Split(raw, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			allowed[o] = struct{}{}
+		}
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			if _, ok := allowed[origin]; ok {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+				w.Header().Set("Vary", "Origin")
+			}
+		}
 
 		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+			if _, ok := allowed[origin]; ok {
+				w.WriteHeader(http.StatusNoContent)
+			} else {
+				w.WriteHeader(http.StatusForbidden)
+			}
 			return
 		}
 
@@ -489,7 +754,7 @@ func resolvePricing(ctx context.Context, configPath string, debug bool, debugLog
 		if path == "" {
 			path = "pricing-debug.log"
 		}
-		debugFile, err = os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		debugFile, err = os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 		if err != nil {
 			return nil, fmt.Errorf("open pricing debug log: %w", err)
 		}
