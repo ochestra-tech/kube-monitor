@@ -60,6 +60,47 @@ type ResourcePricing struct {
 	GPUPricing   map[string]float64
 }
 
+// listAllNodes returns all nodes in the cluster using paginated List calls.
+func listAllNodes(ctx context.Context, clientset *kubernetes.Clientset) ([]v1.Node, error) {
+	const pageSize = 500
+	var all []v1.Node
+	continueToken := ""
+	for {
+		list, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+			Limit:    pageSize,
+			Continue: continueToken,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list nodes: %w", err)
+		}
+		all = append(all, list.Items...)
+		if list.Continue == "" {
+			break
+		}
+		continueToken = list.Continue
+	}
+	return all, nil
+}
+
+// listAllPods returns all pods (across all namespaces) using paginated List calls.
+func listAllPods(ctx context.Context, clientset *kubernetes.Clientset, opts metav1.ListOptions) ([]v1.Pod, error) {
+	const pageSize = 500
+	var all []v1.Pod
+	opts.Limit = pageSize
+	for {
+		list, err := clientset.CoreV1().Pods("").List(ctx, opts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list pods: %w", err)
+		}
+		all = append(all, list.Items...)
+		if list.Continue == "" {
+			break
+		}
+		opts.Continue = list.Continue
+	}
+	return all, nil
+}
+
 // GetNodeCosts calculates costs for all nodes in the cluster
 func GetNodeCosts(
 	ctx context.Context,
@@ -67,15 +108,24 @@ func GetNodeCosts(
 	metricsClient *metricsv.Clientset,
 	pricing map[string]ResourcePricing,
 ) ([]NodeCostData, error) {
-	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	nodeList, err := listAllNodes(ctx, clientset)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list nodes: %w", err)
+		return nil, err
 	}
 
-	results := make([]NodeCostData, 0, len(nodes.Items))
+	// Pre-fetch all pods once and index by node name to avoid N+1 API calls.
+	allPods, err := listAllPods(ctx, clientset, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	podsByNode := make(map[string][]v1.Pod, len(nodeList))
+	for _, pod := range allPods {
+		podsByNode[pod.Spec.NodeName] = append(podsByNode[pod.Spec.NodeName], pod)
+	}
 
-	for _, node := range nodes.Items {
-		// Get node metadata
+	results := make([]NodeCostData, 0, len(nodeList))
+
+	for _, node := range nodeList {
 		nodeData := NodeCostData{
 			Name:         node.Name,
 			InstanceType: node.Labels["node.kubernetes.io/instance-type"],
@@ -86,13 +136,11 @@ func GetNodeCosts(
 		cpuCapacity := float64(node.Status.Capacity.Cpu().Value())
 		memCapacity := float64(node.Status.Capacity.Memory().Value()) / (1024 * 1024 * 1024)
 
-		// Determine which pricing to use based on instance type
 		resourcePricing := pricing["default"]
 		if p, ok := pricing[nodeData.InstanceType]; ok {
 			resourcePricing = p
 		}
 
-		// Calculate CPU cost
 		if resourcePricing.TotalPerHour > 0 {
 			nodeData.TotalCost = resourcePricing.TotalPerHour
 			if resourcePricing.CPU > 0 || resourcePricing.Memory > 0 || resourcePricing.Storage > 0 {
@@ -101,8 +149,6 @@ func GetNodeCosts(
 				nodeData.StorageCost = resourcePricing.Storage
 			} else {
 				nodeData.CPUCost = resourcePricing.TotalPerHour
-				nodeData.MemoryCost = 0
-				nodeData.StorageCost = 0
 			}
 		} else {
 			nodeData.CPUCost = cpuCapacity * resourcePricing.CPU
@@ -110,45 +156,28 @@ func GetNodeCosts(
 
 			var storageCapacity float64
 			for range node.Status.VolumesAttached {
-				// In a real implementation, we would get actual PV sizes
-				// This is a simplified version
-				storageCapacity += 100 // Assume 100GB per attached volume
+				storageCapacity += 100 // Assume 100 GB per attached volume
 			}
 			nodeData.StorageCost = storageCapacity * resourcePricing.Storage
-
 			nodeData.TotalCost = nodeData.CPUCost + nodeData.MemoryCost + nodeData.StorageCost
 		}
 
-		// Calculate utilization and pod count (simplified)
-		pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-			FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name),
-		})
-		if err != nil {
-			log.Printf("Failed to list pods for node %s: %v", node.Name, err)
-		} else {
-			nodeData.PodCount = len(pods.Items)
+		// Compute pod count and utilization from the pre-fetched pod index.
+		nodePods := podsByNode[node.Name]
+		nodeData.PodCount = len(nodePods)
 
-			// Calculate utilization based on total requests vs capacity
-			totalCPURequests := 0.0
-			totalMemRequests := 0.0
-
-			for _, pod := range pods.Items {
-				for _, container := range pod.Spec.Containers {
-					if container.Resources.Requests != nil {
-						cpuReq := float64(container.Resources.Requests.Cpu().MilliValue()) / 1000
-						memReq := float64(container.Resources.Requests.Memory().Value()) / (1024 * 1024 * 1024)
-
-						totalCPURequests += cpuReq
-						totalMemRequests += memReq
-					}
+		totalCPURequests := 0.0
+		totalMemRequests := 0.0
+		for _, pod := range nodePods {
+			for _, container := range pod.Spec.Containers {
+				if container.Resources.Requests != nil {
+					totalCPURequests += float64(container.Resources.Requests.Cpu().MilliValue()) / 1000
+					totalMemRequests += float64(container.Resources.Requests.Memory().Value()) / (1024 * 1024 * 1024)
 				}
 			}
-
-			cpuUtilization := totalCPURequests / cpuCapacity
-			memUtilization := totalMemRequests / memCapacity
-
-			// Average of CPU and memory utilization
-			nodeData.Utilization = (cpuUtilization + memUtilization) / 2 * 100
+		}
+		if cpuCapacity > 0 && memCapacity > 0 {
+			nodeData.Utilization = ((totalCPURequests/cpuCapacity)+(totalMemRequests/memCapacity)) / 2 * 100
 		}
 
 		results = append(results, nodeData)
@@ -164,15 +193,24 @@ func GetPodCosts(
 	metricsClient *metricsv.Clientset,
 	pricing map[string]ResourcePricing,
 ) ([]PodCostData, error) {
-	pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	pods, err := listAllPods(ctx, clientset, metav1.ListOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list pods: %w", err)
+		return nil, err
 	}
 
-	results := make([]PodCostData, 0, len(pods.Items))
+	// Pre-fetch all nodes once and index by name to avoid one Get per pod.
+	nodeList, err := listAllNodes(ctx, clientset)
+	if err != nil {
+		return nil, err
+	}
+	nodeByName := make(map[string]v1.Node, len(nodeList))
+	for _, n := range nodeList {
+		nodeByName[n.Name] = n
+	}
 
-	for _, pod := range pods.Items {
-		// Skip pods that are not running
+	results := make([]PodCostData, 0, len(pods))
+
+	for _, pod := range pods {
 		if pod.Status.Phase != v1.PodRunning {
 			continue
 		}
@@ -184,77 +222,38 @@ func GetPodCosts(
 			QoSClass:  string(pod.Status.QOSClass),
 		}
 
-		// Get node that pod is running on
-		node, err := clientset.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName, metav1.GetOptions{})
-		if err != nil {
-			log.Printf("Failed to get node %s for pod %s/%s: %v", pod.Spec.NodeName, pod.Namespace, pod.Name, err)
-			continue
+		// Resolve pricing from the pre-fetched node map.
+		node, nodeKnown := nodeByName[pod.Spec.NodeName]
+		if !nodeKnown {
+			log.Printf("node %s not found for pod %s/%s; using default pricing", pod.Spec.NodeName, pod.Namespace, pod.Name)
 		}
-
-		// Determine which pricing to use based on node's instance type
 		instanceType := node.Labels["node.kubernetes.io/instance-type"]
 		resourcePricing := pricing["default"]
 		if p, ok := pricing[instanceType]; ok {
 			resourcePricing = p
 		}
 
-		// Calculate pod resource costs
 		totalCPURequests := 0.0
-		totalCPULimits := 0.0
 		totalMemRequests := 0.0
-		totalMemLimits := 0.0
 		totalStorage := 0.0
 
 		for _, container := range pod.Spec.Containers {
-			// CPU requests and limits
 			if container.Resources.Requests != nil {
-				if cpu, ok := container.Resources.Requests.Cpu().AsInt64(); ok {
-					totalCPURequests += float64(cpu)
-				} else {
-					cpuMilliValue := container.Resources.Requests.Cpu().MilliValue()
-					totalCPURequests += float64(cpuMilliValue) / 1000
-				}
-			}
-
-			if container.Resources.Limits != nil {
-				if cpu, ok := container.Resources.Limits.Cpu().AsInt64(); ok {
-					totalCPULimits += float64(cpu)
-				} else {
-					cpuMilliValue := container.Resources.Limits.Cpu().MilliValue()
-					totalCPULimits += float64(cpuMilliValue) / 1000
-				}
-			}
-
-			// Memory requests and limits (convert to GB)
-			if container.Resources.Requests != nil {
+				totalCPURequests += float64(container.Resources.Requests.Cpu().MilliValue()) / 1000
 				totalMemRequests += float64(container.Resources.Requests.Memory().Value()) / (1024 * 1024 * 1024)
 			}
-
-			if container.Resources.Limits != nil {
-				totalMemLimits += float64(container.Resources.Limits.Memory().Value()) / (1024 * 1024 * 1024)
-			}
 		}
 
-		// Calculate storage costs for volumes
 		for _, volume := range pod.Spec.Volumes {
 			if volume.PersistentVolumeClaim != nil {
-				// In a real implementation, we would fetch the PVC and get actual size
-				// This is simplified
-				totalStorage += 10 // Assume 10GB per PVC
+				totalStorage += 10 // Assume 10 GB per PVC
 			}
 		}
 
-		// Calculate costs
 		podData.CPUCost = totalCPURequests * resourcePricing.CPU
 		podData.MemoryCost = totalMemRequests * resourcePricing.Memory
 		podData.StorageCost = totalStorage * resourcePricing.Storage
-		// Network cost would require metrics data
-		podData.NetworkCost = 0
-
-		// Calculate total cost
-		podData.TotalCost = podData.CPUCost + podData.MemoryCost + podData.StorageCost + podData.NetworkCost
-
-		// Calculate efficiency (ratio of usage to requests)
+		podData.TotalCost = podData.CPUCost + podData.MemoryCost + podData.StorageCost
 		podData.Efficiency = 0.8 // Placeholder
 
 		results = append(results, podData)

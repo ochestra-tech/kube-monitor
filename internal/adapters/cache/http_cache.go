@@ -15,8 +15,6 @@ import (
 	ports "github.com/ochestra-tech/k8s-monitor/internal/ports/cache"
 )
 
-const defaultCacheServiceURL = "https://cacheapi-dev.kubeopera.io/"
-
 const cacheRequestTimeout = 5 * time.Second
 
 type httpCache struct {
@@ -35,10 +33,14 @@ type cacheGetResponse struct {
 	Found bool   `json:"found"`
 }
 
+// NewFromEnv creates a cache client from the CACHE_URL environment variable.
+// Returns nil (a no-op cache) when the variable is unset, so callers that
+// nil-check the store will skip caching gracefully without contacting any
+// remote endpoint.
 func NewFromEnv() ports.Store {
 	cacheURL := strings.TrimSpace(os.Getenv("CACHE_URL"))
 	if cacheURL == "" {
-		cacheURL = defaultCacheServiceURL
+		return nil
 	}
 
 	cacheURL = strings.TrimRight(cacheURL, "/")
