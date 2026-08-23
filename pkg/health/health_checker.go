@@ -26,6 +26,9 @@ type ClusterHealth struct {
 	NamespaceHealth    map[string]NamespaceHealth `json:"namespaceHealth"`
 	HealthScore        int                        `json:"healthScore"` // 0-100
 	Issues             []HealthIssue              `json:"issues"`
+	// CheckErrors contains non-fatal errors from individual sub-checks, keyed
+	// by check name.  A non-empty map means the report is partial.
+	CheckErrors map[string]string `json:"checkErrors,omitempty"`
 }
 
 // NodeHealthStatus contains node health information
@@ -137,46 +140,43 @@ func GetClusterHealth(
 		Timestamp:       time.Now(),
 		NamespaceHealth: make(map[string]NamespaceHealth),
 		Issues:          make([]HealthIssue, 0),
+		CheckErrors:     make(map[string]string),
 	}
 
-	// Check node health
+	// Node and pod checks are required — a failure here means we cannot produce
+	// a meaningful report at all.
 	if err := checkNodeHealth(ctx, clientset, &health.NodeStatus); err != nil {
 		return nil, fmt.Errorf("node health check failed: %w", err)
 	}
-
-	// Check pod health
 	if err := checkPodHealth(ctx, clientset, &health.PodStatus); err != nil {
 		return nil, fmt.Errorf("pod health check failed: %w", err)
 	}
 
-	// Check control plane health
+	// The remaining checks are best-effort: failures are recorded in CheckErrors
+	// so callers can distinguish a complete report from a partial one.
 	if err := checkControlPlaneHealth(ctx, clientset, &health.ControlPlaneStatus); err != nil {
 		log.Printf("Control plane health check failed: %v", err)
-		// Continue with partial data
+		health.CheckErrors["controlPlane"] = err.Error()
 	}
-
-	// Check network health
 	if err := checkNetworkHealth(ctx, clientset, &health.NetworkStatus); err != nil {
 		log.Printf("Network health check failed: %v", err)
-		// Continue with partial data
+		health.CheckErrors["network"] = err.Error()
 	}
-
-	// Check resource usage
 	if err := checkResourceUsage(ctx, clientset, metricsClient, &health.ResourceUsage); err != nil {
 		log.Printf("Resource usage check failed: %v", err)
-		// Continue with partial data
+		health.CheckErrors["resourceUsage"] = err.Error()
 	}
-
-	// Check component statuses
 	if err := checkComponentStatuses(ctx, clientset, &health.ComponentStatuses); err != nil {
 		log.Printf("Component status check failed: %v", err)
-		// Continue with partial data
+		health.CheckErrors["componentStatuses"] = err.Error()
 	}
-
-	// Check namespace health
 	if err := checkNamespaceHealth(ctx, clientset, metricsClient, health); err != nil {
 		log.Printf("Namespace health check failed: %v", err)
-		// Continue with partial data
+		health.CheckErrors["namespaceHealth"] = err.Error()
+	}
+
+	if len(health.CheckErrors) == 0 {
+		health.CheckErrors = nil // omitempty: omit from JSON when all checks passed
 	}
 
 	// Identify health issues

@@ -398,166 +398,7 @@ func (o *ResourceOptimizer) GenerateOptimizationReport(
 
 	// Prometheus-backed signals (network + storage).
 	if o.promClient != nil {
-		report.Telemetry.PrometheusConfigured = true
-		if _, err := o.promClient.QueryVector(ctx, "up"); err != nil {
-			report.Telemetry.PrometheusReachable = false
-			report.Telemetry.PrometheusError = err.Error()
-		} else {
-			report.Telemetry.PrometheusReachable = true
-		}
-
-		if !report.Telemetry.PrometheusReachable {
-			// Prometheus is not reachable; skip network/storage to avoid failing the whole report.
-			goto PROM_DONE
-		}
-
-		if opts.IncludeNetwork {
-			rxSamples, err := o.promClient.QueryVector(ctx, `sum by (namespace,pod) (rate(container_network_receive_bytes_total{namespace!="",pod!=""}[5m]))`)
-			if err != nil {
-				report.Telemetry.PrometheusError = fmt.Sprintf("network rx query failed: %v", err)
-				goto PROM_DONE
-			}
-			txSamples, err := o.promClient.QueryVector(ctx, `sum by (namespace,pod) (rate(container_network_transmit_bytes_total{namespace!="",pod!=""}[5m]))`)
-			if err != nil {
-				report.Telemetry.PrometheusError = fmt.Sprintf("network tx query failed: %v", err)
-				goto PROM_DONE
-			}
-			report.Telemetry.NetworkMetricsAvailable = len(rxSamples) > 0 || len(txSamples) > 0
-
-			rx := make(map[string]float64, len(rxSamples))
-			for _, s := range rxSamples {
-				ns := s.Labels["namespace"]
-				pod := s.Labels["pod"]
-				if ns == "" || pod == "" {
-					continue
-				}
-				rx[fmt.Sprintf("%s/%s", ns, pod)] = s.Value
-			}
-			tx := make(map[string]float64, len(txSamples))
-			for _, s := range txSamples {
-				ns := s.Labels["namespace"]
-				pod := s.Labels["pod"]
-				if ns == "" || pod == "" {
-					continue
-				}
-				tx[fmt.Sprintf("%s/%s", ns, pod)] = s.Value
-			}
-
-			for key, rxv := range rx {
-				txv := tx[key]
-				parts := strings.SplitN(key, "/", 2)
-				if len(parts) != 2 {
-					continue
-				}
-				ns, podName := parts[0], parts[1]
-
-				if opts.Namespace != "" && safeString(ns) != safeString(opts.Namespace) {
-					continue
-				}
-				if opts.Pod != "" && safeString(podName) != safeString(opts.Pod) {
-					continue
-				}
-
-				if (rxv + txv) > opts.NetworkIdleBytesPerSec {
-					continue
-				}
-
-				if opts.View != ViewSummary {
-					report.Details = append(report.Details, Detail{
-						Category:                   "network_idle",
-						Level:                      "pod",
-						Namespace:                  ns,
-						Pod:                        podName,
-						NetworkReceiveBytesPerSec:  rxv,
-						NetworkTransmitBytesPerSec: txv,
-						Recommendation:             "Pod network throughput is very low; consider scaling down replicas or consolidating if truly idle.",
-					})
-				}
-			}
-		}
-
-		if opts.IncludeStorage {
-			usedSamples, err := o.promClient.QueryVector(ctx, `sum by (namespace,persistentvolumeclaim) (kubelet_volume_stats_used_bytes{namespace!="",persistentvolumeclaim!=""})`)
-			if err != nil {
-				report.Telemetry.PrometheusError = fmt.Sprintf("pvc used query failed: %v", err)
-				goto PROM_DONE
-			}
-			capSamples, err := o.promClient.QueryVector(ctx, `sum by (namespace,persistentvolumeclaim) (kubelet_volume_stats_capacity_bytes{namespace!="",persistentvolumeclaim!=""})`)
-			if err != nil {
-				report.Telemetry.PrometheusError = fmt.Sprintf("pvc capacity query failed: %v", err)
-				goto PROM_DONE
-			}
-			report.Telemetry.StorageMetricsAvailable = len(usedSamples) > 0 || len(capSamples) > 0
-
-			used := make(map[string]float64, len(usedSamples))
-			for _, s := range usedSamples {
-				ns := s.Labels["namespace"]
-				pvc := s.Labels["persistentvolumeclaim"]
-				if ns == "" || pvc == "" {
-					continue
-				}
-				used[fmt.Sprintf("%s/%s", ns, pvc)] = s.Value
-			}
-			cap := make(map[string]float64, len(capSamples))
-			for _, s := range capSamples {
-				ns := s.Labels["namespace"]
-				pvc := s.Labels["persistentvolumeclaim"]
-				if ns == "" || pvc == "" {
-					continue
-				}
-				cap[fmt.Sprintf("%s/%s", ns, pvc)] = s.Value
-			}
-
-			for key, usedBytesF := range used {
-				capBytesF := cap[key]
-				if capBytesF <= 0 {
-					continue
-				}
-				util := (usedBytesF / capBytesF) * 100.0
-				if util > opts.StorageLowUtilPercent {
-					continue
-				}
-
-				parts := strings.SplitN(key, "/", 2)
-				if len(parts) != 2 {
-					continue
-				}
-				ns, pvcName := parts[0], parts[1]
-				if opts.Namespace != "" && safeString(ns) != safeString(opts.Namespace) {
-					continue
-				}
-
-				usedBytes := int64(math.Round(usedBytesF))
-				capBytes := int64(math.Round(capBytesF))
-				suggested := int64(math.Ceil(float64(usedBytes) * opts.HeadroomFactor))
-				wasted := capBytes - suggested
-				if wasted < 0 {
-					wasted = 0
-				}
-
-				saving := (float64(wasted) / float64(1024*1024*1024)) * p.Storage * monthlyHours
-				if saving > 0 {
-					report.Summary.PotentialMonthlySavings += saving
-				}
-
-				if opts.View != ViewSummary {
-					report.Details = append(report.Details, Detail{
-						Category:               "storage_overprovisioned",
-						Level:                  "pvc",
-						Namespace:              ns,
-						PVC:                    pvcName,
-						PVCUsedBytes:           usedBytes,
-						PVCCapacityBytes:       capBytes,
-						PVCUtilizationPercent:  util,
-						PVCWastedBytes:         wasted,
-						PotentialMonthlySaving: saving,
-						Recommendation:         "PVC utilization is low; consider right-sizing (if your storage supports shrink) or migrate data to a smaller volume/class.",
-					})
-				}
-			}
-		}
-
-	PROM_DONE:
+		o.applyPrometheusSignals(ctx, report, opts, p, monthlyHours)
 	}
 
 	report.Summary.IdleResources = Counts{
@@ -683,4 +524,160 @@ func nodeCapacities(ctx context.Context, clientset *kubernetes.Clientset) (map[s
 		mem[n.Name] = n.Status.Capacity.Memory().Value()
 	}
 	return cpu, mem, nil
+}
+
+// applyPrometheusSignals queries Prometheus for network/storage signals and
+// annotates the report in place.  All errors are non-fatal: they are recorded
+// in report.Telemetry and the method returns early rather than using goto.
+func (o *ResourceOptimizer) applyPrometheusSignals(
+	ctx context.Context,
+	report *OptimizationReport,
+	opts Options,
+	p cost.ResourcePricing,
+	monthlyHours float64,
+) {
+	report.Telemetry.PrometheusConfigured = true
+
+	if _, err := o.promClient.QueryVector(ctx, "up"); err != nil {
+		report.Telemetry.PrometheusReachable = false
+		report.Telemetry.PrometheusError = err.Error()
+		return
+	}
+	report.Telemetry.PrometheusReachable = true
+
+	if opts.IncludeNetwork {
+		rxSamples, err := o.promClient.QueryVector(ctx, `sum by (namespace,pod) (rate(container_network_receive_bytes_total{namespace!="",pod!=""}[5m]))`)
+		if err != nil {
+			report.Telemetry.PrometheusError = fmt.Sprintf("network rx query failed: %v", err)
+			return
+		}
+		txSamples, err := o.promClient.QueryVector(ctx, `sum by (namespace,pod) (rate(container_network_transmit_bytes_total{namespace!="",pod!=""}[5m]))`)
+		if err != nil {
+			report.Telemetry.PrometheusError = fmt.Sprintf("network tx query failed: %v", err)
+			return
+		}
+		report.Telemetry.NetworkMetricsAvailable = len(rxSamples) > 0 || len(txSamples) > 0
+
+		rx := make(map[string]float64, len(rxSamples))
+		for _, s := range rxSamples {
+			ns, pod := s.Labels["namespace"], s.Labels["pod"]
+			if ns == "" || pod == "" {
+				continue
+			}
+			rx[fmt.Sprintf("%s/%s", ns, pod)] = s.Value
+		}
+		tx := make(map[string]float64, len(txSamples))
+		for _, s := range txSamples {
+			ns, pod := s.Labels["namespace"], s.Labels["pod"]
+			if ns == "" || pod == "" {
+				continue
+			}
+			tx[fmt.Sprintf("%s/%s", ns, pod)] = s.Value
+		}
+
+		for key, rxv := range rx {
+			txv := tx[key]
+			parts := strings.SplitN(key, "/", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			ns, podName := parts[0], parts[1]
+			if opts.Namespace != "" && safeString(ns) != safeString(opts.Namespace) {
+				continue
+			}
+			if opts.Pod != "" && safeString(podName) != safeString(opts.Pod) {
+				continue
+			}
+			if (rxv + txv) > opts.NetworkIdleBytesPerSec {
+				continue
+			}
+			if opts.View != ViewSummary {
+				report.Details = append(report.Details, Detail{
+					Category:                   "network_idle",
+					Level:                      "pod",
+					Namespace:                  ns,
+					Pod:                        podName,
+					NetworkReceiveBytesPerSec:  rxv,
+					NetworkTransmitBytesPerSec: txv,
+					Recommendation:             "Pod network throughput is very low; consider scaling down replicas or consolidating if truly idle.",
+				})
+			}
+		}
+	}
+
+	if opts.IncludeStorage {
+		usedSamples, err := o.promClient.QueryVector(ctx, `sum by (namespace,persistentvolumeclaim) (kubelet_volume_stats_used_bytes{namespace!="",persistentvolumeclaim!=""})`)
+		if err != nil {
+			report.Telemetry.PrometheusError = fmt.Sprintf("pvc used query failed: %v", err)
+			return
+		}
+		capSamples, err := o.promClient.QueryVector(ctx, `sum by (namespace,persistentvolumeclaim) (kubelet_volume_stats_capacity_bytes{namespace!="",persistentvolumeclaim!=""})`)
+		if err != nil {
+			report.Telemetry.PrometheusError = fmt.Sprintf("pvc capacity query failed: %v", err)
+			return
+		}
+		report.Telemetry.StorageMetricsAvailable = len(usedSamples) > 0 || len(capSamples) > 0
+
+		used := make(map[string]float64, len(usedSamples))
+		for _, s := range usedSamples {
+			ns, pvc := s.Labels["namespace"], s.Labels["persistentvolumeclaim"]
+			if ns == "" || pvc == "" {
+				continue
+			}
+			used[fmt.Sprintf("%s/%s", ns, pvc)] = s.Value
+		}
+		cap := make(map[string]float64, len(capSamples))
+		for _, s := range capSamples {
+			ns, pvc := s.Labels["namespace"], s.Labels["persistentvolumeclaim"]
+			if ns == "" || pvc == "" {
+				continue
+			}
+			cap[fmt.Sprintf("%s/%s", ns, pvc)] = s.Value
+		}
+
+		for key, usedBytesF := range used {
+			capBytesF := cap[key]
+			if capBytesF <= 0 {
+				continue
+			}
+			util := (usedBytesF / capBytesF) * 100.0
+			if util > opts.StorageLowUtilPercent {
+				continue
+			}
+			parts := strings.SplitN(key, "/", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			ns, pvcName := parts[0], parts[1]
+			if opts.Namespace != "" && safeString(ns) != safeString(opts.Namespace) {
+				continue
+			}
+
+			usedBytes := int64(math.Round(usedBytesF))
+			capBytes := int64(math.Round(capBytesF))
+			suggested := int64(math.Ceil(float64(usedBytes) * opts.HeadroomFactor))
+			wasted := capBytes - suggested
+			if wasted < 0 {
+				wasted = 0
+			}
+			saving := (float64(wasted) / float64(1024*1024*1024)) * p.Storage * monthlyHours
+			if saving > 0 {
+				report.Summary.PotentialMonthlySavings += saving
+			}
+			if opts.View != ViewSummary {
+				report.Details = append(report.Details, Detail{
+					Category:               "storage_overprovisioned",
+					Level:                  "pvc",
+					Namespace:              ns,
+					PVC:                    pvcName,
+					PVCUsedBytes:           usedBytes,
+					PVCCapacityBytes:       capBytes,
+					PVCUtilizationPercent:  util,
+					PVCWastedBytes:         wasted,
+					PotentialMonthlySaving: saving,
+					Recommendation:         "PVC utilization is low; consider right-sizing (if your storage supports shrink) or migrate data to a smaller volume/class.",
+				})
+			}
+		}
+	}
 }

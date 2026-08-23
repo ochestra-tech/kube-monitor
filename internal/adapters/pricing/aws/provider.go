@@ -78,7 +78,11 @@ func (p *Provider) Fetch(ctx context.Context, req ports.Request) ([]domain.Insta
 			continue
 		}
 
-		price, currency, vcpu, memGB := extractOnDemandPrice(json.RawMessage(out.PriceList[0]))
+		price, currency, vcpu, memGB, err := extractOnDemandPrice(json.RawMessage(out.PriceList[0]))
+		if err != nil {
+			p.debugf("[pricing][aws] %s: failed to parse price list entry: %v", instanceType, err)
+			continue
+		}
 		if price <= 0 {
 			continue
 		}
@@ -104,21 +108,21 @@ func (p *Provider) Fetch(ctx context.Context, req ports.Request) ([]domain.Insta
 	return mapToList(results), nil
 }
 
-func extractOnDemandPrice(raw json.RawMessage) (float64, string, float64, float64) {
+func extractOnDemandPrice(raw json.RawMessage) (float64, string, float64, float64, error) {
 	var payload map[string]interface{}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return 0, "", 0, 0
+		return 0, "", 0, 0, fmt.Errorf("failed to unmarshal price list entry: %w", err)
 	}
 
 	vcpu, memGB := extractResources(payload)
 
 	terms, ok := payload["terms"].(map[string]interface{})
 	if !ok {
-		return 0, "", vcpu, memGB
+		return 0, "", vcpu, memGB, nil
 	}
 	od, ok := terms["OnDemand"].(map[string]interface{})
 	if !ok {
-		return 0, "", vcpu, memGB
+		return 0, "", vcpu, memGB, nil
 	}
 
 	for _, term := range od {
@@ -148,12 +152,12 @@ func extractOnDemandPrice(raw json.RawMessage) (float64, string, float64, float6
 				if err != nil {
 					continue
 				}
-				return price, currency, vcpu, memGB
+				return price, currency, vcpu, memGB, nil
 			}
 		}
 	}
 
-	return 0, "", vcpu, memGB
+	return 0, "", vcpu, memGB, nil
 }
 
 func regionName(code string) string {
