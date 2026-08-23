@@ -12,6 +12,12 @@ concurrency:
   group: k8s-monitor-ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GITOPS_REPO: ochestra-tech/gitops-iac
+  GITOPS_BASE_BRANCH: main
+  GITOPS_DEPLOYMENT_PATH: fluxcd/apps/k8-monitor/base/deployment.yaml
+  GITOPS_CONTAINER_NAME: kube-monitor
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -81,3 +87,67 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  gitops-update:
+    name: Update GitOps deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: docker
+    permissions:
+      contents: read
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - name: Compute vars
+        id: vars
+        run: echo "sha_short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate GitOps token
+        id: token-check
+        env:
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+        run: |
+          if [ -n "$GITOPS_TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::GITOPS_TOKEN detected; GitOps PR automation is enabled for ${GITOPS_REPO}."
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Repository secret GITOPS_TOKEN is not set for this run. This workflow does not use GITHUB_TOKEN for cross-repo GitOps PRs to ${GITOPS_REPO}. If you just added GITOPS_TOKEN, rerun the workflow because secrets are snapshotted at job start."
+          fi
+
+      - name: Checkout GitOps repo
+        if: steps.token-check.outputs.available == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          ref: ${{ env.GITOPS_BASE_BRANCH }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Set image tag
+        if: steps.token-check.outputs.available == 'true'
+        run: echo "IMAGE_WITH_TAG=ghcr.io/ochestra-tech/kube-monitor:sha-${{ steps.vars.outputs.sha_short }}" >> $GITHUB_ENV
+
+      - name: Update Deployment image
+        if: steps.token-check.outputs.available == 'true'
+        uses: mikefarah/yq@v4.45.1
+        with:
+          cmd: |
+            yq -i '.spec.template.spec.containers[] |= (select(.name == strenv(GITOPS_CONTAINER_NAME)).image = strenv(IMAGE_WITH_TAG))' "gitops/${{ env.GITOPS_DEPLOYMENT_PATH }}"
+
+      - name: Create GitOps PR
+        if: steps.token-check.outputs.available == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+          base: ${{ env.GITOPS_BASE_BRANCH }}
+          branch: ci/k8s-monitor-${{ steps.vars.outputs.sha_short }}
+          delete-branch: true
+          title: "chore(k8s-monitor): deploy sha-${{ steps.vars.outputs.sha_short }}"
+          commit-message: "chore(k8s-monitor): bump image to sha-${{ steps.vars.outputs.sha_short }}"
+          body: |
+            Updates k8-monitor image to `ghcr.io/ochestra-tech/kube-monitor:sha-${{ steps.vars.outputs.sha_short }}`.
+
+      - name: GitOps update skipped
+        if: steps.token-check.outputs.available != 'true'
+        run: echo "GITOPS_TOKEN is not set; skipping GitOps update."
