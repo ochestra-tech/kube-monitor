@@ -144,9 +144,19 @@ func GetNodeCosts(
 		if resourcePricing.TotalPerHour > 0 {
 			nodeData.TotalCost = resourcePricing.TotalPerHour
 			if resourcePricing.CPU > 0 || resourcePricing.Memory > 0 || resourcePricing.Storage > 0 {
-				nodeData.CPUCost = resourcePricing.CPU
-				nodeData.MemoryCost = resourcePricing.Memory
-				nodeData.StorageCost = resourcePricing.Storage
+				// CPU/Memory/Storage here are per-unit rates (dollars per
+				// vCPU-hour / GB-hour), not node totals -- must be scaled
+				// by this node's actual capacity, same as the static-price
+				// branch below. Assigning them directly previously made
+				// every node of a given instance type show an identical
+				// CPU/Memory cost regardless of its real capacity.
+				nodeData.CPUCost = cpuCapacity * resourcePricing.CPU
+				nodeData.MemoryCost = memCapacity * resourcePricing.Memory
+				var storageCapacity float64
+				for range node.Status.VolumesAttached {
+					storageCapacity += 100 // Assume 100 GB per attached volume
+				}
+				nodeData.StorageCost = storageCapacity * resourcePricing.Storage
 			} else {
 				nodeData.CPUCost = resourcePricing.TotalPerHour
 			}
