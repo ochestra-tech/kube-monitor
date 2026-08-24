@@ -75,6 +75,7 @@ func (p *Provider) Fetch(ctx context.Context, req ports.Request) ([]domain.Insta
 			return nil, err
 		}
 		if len(out.PriceList) == 0 {
+			log.Printf("[pricing][aws] %s: GetProducts returned 0 results for location=%q -- check region-name mapping or IAM pricing:GetProducts permission; falling back to generic defaults for this instance type", instanceType, regionName(req.Region))
 			continue
 		}
 
@@ -161,17 +162,41 @@ func extractOnDemandPrice(raw json.RawMessage) (float64, string, float64, float6
 }
 
 func regionName(code string) string {
-	// AWS Pricing API uses human-readable region names.
+	// AWS Pricing API uses human-readable region names for its "location"
+	// filter attribute -- an unmapped region code is sent through as-is,
+	// matches no real product, and GetProducts silently returns zero
+	// results (not an error), which cascades into a generic-defaults
+	// fallback with no visible signal anything went wrong.
 	mapping := map[string]string{
 		"us-east-1":      "US East (N. Virginia)",
 		"us-east-2":      "US East (Ohio)",
 		"us-west-1":      "US West (N. California)",
 		"us-west-2":      "US West (Oregon)",
-		"eu-west-1":      "EU (Ireland)",
-		"eu-west-2":      "EU (London)",
-		"eu-central-1":   "EU (Frankfurt)",
+		"af-south-1":     "Africa (Cape Town)",
+		"ap-east-1":      "Asia Pacific (Hong Kong)",
+		"ap-south-1":     "Asia Pacific (Mumbai)",
+		"ap-south-2":     "Asia Pacific (Hyderabad)",
+		"ap-northeast-1": "Asia Pacific (Tokyo)",
+		"ap-northeast-2": "Asia Pacific (Seoul)",
+		"ap-northeast-3": "Asia Pacific (Osaka)",
 		"ap-southeast-1": "Asia Pacific (Singapore)",
 		"ap-southeast-2": "Asia Pacific (Sydney)",
+		"ap-southeast-3": "Asia Pacific (Jakarta)",
+		"ap-southeast-4": "Asia Pacific (Melbourne)",
+		"ca-central-1":   "Canada (Central)",
+		"ca-west-1":      "Canada West (Calgary)",
+		"eu-central-1":   "EU (Frankfurt)",
+		"eu-central-2":   "EU (Zurich)",
+		"eu-west-1":      "EU (Ireland)",
+		"eu-west-2":      "EU (London)",
+		"eu-west-3":      "EU (Paris)",
+		"eu-north-1":     "EU (Stockholm)",
+		"eu-south-1":     "EU (Milan)",
+		"eu-south-2":     "EU (Spain)",
+		"me-south-1":     "Middle East (Bahrain)",
+		"me-central-1":   "Middle East (UAE)",
+		"il-central-1":   "Israel (Tel Aviv)",
+		"sa-east-1":      "South America (Sao Paulo)",
 	}
 	if name, ok := mapping[code]; ok {
 		return name
