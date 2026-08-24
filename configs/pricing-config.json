@@ -1,5 +1,5 @@
 {
-  "source": "auto",
+  "source": "aws",
   "cacheTtl": "6h",
   "defaults": {
     "cpu": 0.03,

@@ -157,7 +157,17 @@ func main() {
 	clientset, metricsClient := initKubernetesClients(config.KubeConfigPath, config.KubeQPS, config.KubeBurst)
 	pricing, err := resolvePricing(ctx, config.PricingConfigPath, config.PricingDebug, config.PricingDebugLogPath)
 	if err != nil {
-		log.Fatalf("Failed to resolve pricing: %v", err)
+		// KUB-114: pricing-config.json's source is now "aws" only (no
+		// static/auto fallback), by design -- but that means a transient
+		// AWS API issue (rate limit, brief network blip, credential
+		// expiry) must not take down cluster health/anomaly monitoring
+		// along with it. Degrade to a nil pricing map instead of exiting:
+		// GetNodeCosts/GetPodCosts only ever read from this map (a nil map
+		// read is a safe zero-value lookup, never a panic), so cost
+		// figures come back honestly zero/unavailable rather than the
+		// whole process going down over a pricing-only failure.
+		log.Printf("[pricing] resolution failed, cost data will be unavailable until this recovers: %v", err)
+		pricing = nil
 	}
 
 	// ── Time-series store + anomaly detection ──────────────────────────────────
