@@ -352,6 +352,7 @@ func startMetricsServer(
 	mux.Handle("/api/cost", withCORS(reportHandler("cost", clientset, metricsClient, pricing, config.RequestTimeout)))
 	mux.Handle("/api/combined", withCORS(reportHandler("combined", clientset, metricsClient, pricing, config.RequestTimeout)))
 	mux.Handle("/api/optimizer", withCORS(optimizerHandler(clientset, metricsClient, pricing, config.RequestTimeout)))
+	mux.Handle("/api/cost/namespace", withCORS(namespaceCostHandler(clientset, metricsClient, pricing, config.RequestTimeout)))
 	mux.Handle("/api/history", withCORS(historyHandler(tsStore, config.ClusterID, config.RequestTimeout)))
 	mux.Handle("/api/anomalies", withCORS(anomaliesHandler(tsStore, config.ClusterID, config.AnomalyWindowSize, config.AnomalyZThreshold, config.RequestTimeout)))
 
@@ -706,6 +707,71 @@ func reportHandler(
 		if _, err := w.Write(buf.Bytes()); err != nil {
 			log.Printf("Failed to write %s report response: %v", reportType, err)
 		}
+	}
+}
+
+// namespaceCostHandler serves namespace/pod cost data pre-filtered to one
+// namespace -- a separate, standalone handler (mirroring optimizerHandler's
+// pattern) rather than adding a namespace branch to reportHandler/
+// Service.Generate, so the existing /api/cost (used by the admin dashboard)
+// is untouched. Deliberately omits node costs: nodes are shared host
+// infrastructure with no per-namespace attribution, so returning them here
+// would either leak other tenants' cost data or require inventing a
+// pro-rating scheme that doesn't exist today (see the "Cost" tier-1 note in
+// the tenant-scoping plan). `namespace` is required -- this endpoint is not
+// a scoped-down /api/cost, it's a single-namespace lookup.
+func namespaceCostHandler(
+	clientset *kubernetes.Clientset,
+	metricsClient *metricsv.Clientset,
+	pricing map[string]cost.ResourcePricing,
+	timeout time.Duration,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		namespace := r.URL.Query().Get("namespace")
+		if namespace == "" {
+			http.Error(w, `{"error":"namespace query param is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		ctx := r.Context()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+
+		podCosts, err := cost.GetPodCosts(ctx, clientset, metricsClient, pricing)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, context.DeadlineExceeded) {
+				status = http.StatusGatewayTimeout
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to compute namespace cost", "details": err.Error()})
+			return
+		}
+
+		filtered := make([]cost.PodCostData, 0, len(podCosts))
+		for _, p := range podCosts {
+			if p.Namespace == namespace {
+				filtered = append(filtered, p)
+			}
+		}
+		namespaceCosts := cost.GetNamespaceCosts(filtered)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"pods":       filtered,
+			"namespaces": namespaceCosts,
+			"timestamp":  time.Now().UTC(),
+		})
 	}
 }
 
