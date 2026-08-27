@@ -20,6 +20,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -353,6 +354,7 @@ func startMetricsServer(
 	mux.Handle("/api/combined", withCORS(reportHandler("combined", clientset, metricsClient, pricing, config.RequestTimeout)))
 	mux.Handle("/api/optimizer", withCORS(optimizerHandler(clientset, metricsClient, pricing, config.RequestTimeout)))
 	mux.Handle("/api/cost/namespace", withCORS(namespaceCostHandler(clientset, metricsClient, pricing, config.RequestTimeout)))
+	mux.Handle("/api/health/namespace", withCORS(namespaceHealthHandler(clientset, metricsClient, config.RequestTimeout)))
 	mux.Handle("/api/history", withCORS(historyHandler(tsStore, config.ClusterID, config.RequestTimeout)))
 	mux.Handle("/api/anomalies", withCORS(anomaliesHandler(tsStore, config.ClusterID, config.AnomalyWindowSize, config.AnomalyZThreshold, config.RequestTimeout)))
 
@@ -771,6 +773,143 @@ func namespaceCostHandler(
 			"pods":       filtered,
 			"namespaces": namespaceCosts,
 			"timestamp":  time.Now().UTC(),
+		})
+	}
+}
+
+// namespacePodHealth is a namespace-scoped subset of pkg/health's
+// PodHealthStatus, computed directly here rather than reusing
+// health.checkPodHealth (unexported, and scoped to all-namespaces by
+// design) -- same "standalone handler mirrors optimizerHandler's pattern"
+// choice as namespaceCostHandler, to avoid touching the cluster-wide health
+// path at all.
+type namespacePodHealth struct {
+	TotalPods        int      `json:"totalPods"`
+	RunningPods      int      `json:"runningPods"`
+	PendingPods      int      `json:"pendingPods"`
+	FailedPods       int      `json:"failedPods"`
+	RestartingPods   int      `json:"restartingPods"`
+	CrashLoopingPods []string `json:"crashLoopingPods"`
+}
+
+// namespaceHealthHandler serves live, point-in-time pod health + resource
+// usage scoped to one namespace -- the namespace-scoped counterpart to
+// namespaceCostHandler, filling the gap found while wiring
+// observability-agent-srv for per-tenant AI Operations: k8s-monitor's
+// existing /api/health is cluster-wide only (checkResourceUsage sums every
+// node; checkNamespaceHealth exists but its ResourceUsage is explicitly
+// left empty and its HealthScore field is dead, always 100). `namespace` is
+// required, same convention as /api/cost/namespace.
+func namespaceHealthHandler(
+	clientset *kubernetes.Clientset,
+	metricsClient *metricsv.Clientset,
+	timeout time.Duration,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		namespace := r.URL.Query().Get("namespace")
+		if namespace == "" {
+			http.Error(w, `{"error":"namespace query param is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		ctx := r.Context()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+
+		pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, context.DeadlineExceeded) {
+				status = http.StatusGatewayTimeout
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to compute namespace health", "details": err.Error()})
+			return
+		}
+
+		podHealth := namespacePodHealth{CrashLoopingPods: []string{}}
+		const restartRecentWindow = 15 * time.Minute
+		for _, pod := range pods.Items {
+			podHealth.TotalPods++
+			switch pod.Status.Phase {
+			case corev1.PodRunning:
+				podHealth.RunningPods++
+			case corev1.PodPending:
+				podHealth.PendingPods++
+			case corev1.PodFailed:
+				podHealth.FailedPods++
+			}
+
+			restartedRecently := false
+			for _, cs := range pod.Status.ContainerStatuses {
+				if cs.RestartCount > 0 {
+					if cs.LastTerminationState.Terminated != nil &&
+						time.Since(cs.LastTerminationState.Terminated.FinishedAt.Time) <= restartRecentWindow {
+						restartedRecently = true
+					}
+					if cs.State.Waiting != nil && cs.State.Waiting.Reason == "CrashLoopBackOff" {
+						restartedRecently = true
+						podHealth.CrashLoopingPods = append(podHealth.CrashLoopingPods, pod.Name)
+					}
+				}
+			}
+			if restartedRecently {
+				podHealth.RestartingPods++
+			}
+		}
+
+		// Live CPU/Mem usage (point-in-time, no history -- same metrics.k8s.io
+		// source as /api/cost/namespace and the frontend's own metrics-pods
+		// passthrough) rather than the cluster-wide %s checkResourceUsage
+		// computes.
+		var cpuMilli, memBytes int64
+		if podMetrics, err := metricsClient.MetricsV1beta1().PodMetricses(namespace).List(ctx, metav1.ListOptions{}); err == nil {
+			for _, pm := range podMetrics.Items {
+				for _, c := range pm.Containers {
+					cpuMilli += c.Usage.Cpu().MilliValue()
+					memBytes += c.Usage.Memory().Value()
+				}
+			}
+		}
+
+		// A simple, distinctly-labeled approximation -- k8s-monitor's own
+		// per-namespace HealthScore field (checkNamespaceHealth) is dead
+		// (always 100), there's no real formula to reuse from the cluster-wide
+		// score either since node/control-plane inputs don't apply to one
+		// namespace.
+		var healthScore int
+		if podHealth.TotalPods == 0 {
+			healthScore = 100
+		} else {
+			runningPct := float64(podHealth.RunningPods) / float64(podHealth.TotalPods) * 100
+			penalty := float64(podHealth.RestartingPods)*10 + float64(podHealth.FailedPods)*15
+			healthScore = int(runningPct - penalty)
+			if healthScore < 0 {
+				healthScore = 0
+			}
+			if healthScore > 100 {
+				healthScore = 100
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"namespace":   namespace,
+			"healthScore": healthScore,
+			"podStatus":   podHealth,
+			"cpuMilli":    cpuMilli,
+			"memoryBytes": memBytes,
+			"timestamp":   time.Now().UTC(),
 		})
 	}
 }
