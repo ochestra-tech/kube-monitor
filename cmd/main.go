@@ -610,6 +610,24 @@ func optimizerHandler(
 			return
 		}
 
+		// Node-level Details always carry the node's true cluster-wide
+		// capacity/usage (nodeCapacities/buildNodeUsageMap in analysis.go
+		// aren't namespace-filtered even when opts.Namespace is), regardless
+		// of how the pod-driven aggregation that decides idle/overprovisioned
+		// status was scoped. Strip them whenever a namespace filter is set --
+		// this endpoint is reachable by a tenant caller scoped to one
+		// namespace, and cluster-wide node capacity/utilization isn't theirs
+		// to see.
+		if opts.Namespace != "" {
+			filtered := report.Details[:0]
+			for _, d := range report.Details {
+				if d.Level != "node" {
+					filtered = append(filtered, d)
+				}
+			}
+			report.Details = filtered
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		if err := json.NewEncoder(w).Encode(report); err != nil {
